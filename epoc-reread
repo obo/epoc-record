@@ -253,6 +253,30 @@ DEFAULT_FINE_PAD_FRACTION = 0.10
 DEFAULT_FINE_PERCENTILE = (1.0, 99.0)
 DEFAULT_MATCH_TOLERANCE_S = 120.0
 
+# --channel-packing: EmotivPRO's Amplitude min/max fields are only
+# editable while exactly one channel is checked in the "Show/hide
+# channel(s)" panel. Confirmed live, twice, with different channel
+# pairs: the instant a 2nd box is checked, both fields snap to
+# -100/100 and gray out (uneditable) REGARDLESS of what was typed in
+# while only one channel was checked -- a custom range set moments
+# earlier on a lone channel is discarded, not remembered. There is no
+# way to request any other shared range for a multi-channel view; this
+# is the one and only range a packed (2-4 channel) capture can ever
+# use. The High-pass checkbox locks the same way, which is why
+# select_group() sets it (via EmotivProUI.select_only, reusing its
+# already-confirmed all-off-then-check-one dance) BEFORE adding the
+# rest of the group -- same ordering lesson as run_one_pass's own
+# high-pass-before-amplitude comment, just one level earlier.
+PACKED_AMPLITUDE_UV = 100.0
+PACK_MAX_GROUP = 4
+# How close (as a ratio of the larger to the smaller) two channels'
+# own planned amp_min/amp_max for a given zoom-level tier need to be to
+# share one packed capture at PACKED_AMPLITUDE_UV without wasting too
+# much of either channel's resolution. A judgment call, not something
+# confirmed live -- there's no "correct" value, just a knob for how
+# much resolution a pack is allowed to sacrifice for the ~4x speedup.
+PACK_SIMILARITY_RATIO = 2.0
+
 
 # --- xdotool wrapper -------------------------------------------------------
 
@@ -441,6 +465,64 @@ def tag_for_range(amp_min: float, amp_max: float) -> str:
     return f"{fmt(amp_min)}_{fmt(amp_max)}"
 
 
+def plan_channel_packs(
+    channels: List[str],
+    levels_by_channel: Dict[str, List[Tuple[float, float, str]]],
+    n_levels: int,
+) -> List[List[List[str]]]:
+    """--channel-packing's grouping plan: for each of the n_levels
+    zoom-level TIERS (index-aligned across channels -- every channel
+    gets the same COUNT of levels out of plan_zoom_levels, just planned
+    independently from its own stats, so tier 0 is "fine" for everyone,
+    tier 1 is "wide" for everyone, etc.), groups channels whose
+    tier-level target range both (a) fits inside +/-PACKED_AMPLITUDE_UV
+    without clipping and (b) is within PACK_SIMILARITY_RATIO of each
+    other -- the only combination EmotivPRO's forced, non-editable
+    +/-PACKED_AMPLITUDE_UV multi-channel-select range (see
+    select_group's comment) doesn't waste. Up to PACK_MAX_GROUP
+    channels per group, greedy by descending target magnitude -- not
+    globally optimal, but this is a speed knob, not a correctness one.
+
+    Returns, per tier index, a list of channel groups (each group is
+    re-read together in ONE pass); channels that don't fit any pack at
+    a given tier come back as their own singleton group, unpacked,
+    reading their own tailored range exactly as without
+    --channel-packing at all."""
+    tiers: List[List[List[str]]] = []
+    for t in range(n_levels):
+        candidates: List[Tuple[str, float]] = []
+        for ch in channels:
+            levels = levels_by_channel[ch]
+            if t >= len(levels):
+                continue
+            amp_min, amp_max, _tag = levels[t]
+            mag = max(abs(amp_min), abs(amp_max))
+            if mag <= PACKED_AMPLITUDE_UV:
+                candidates.append((ch, mag))
+        candidates.sort(key=lambda p: -p[1])
+
+        groups: List[List[str]] = []
+        packed: set = set()
+        for i, (ch0, mag0) in enumerate(candidates):
+            if ch0 in packed:
+                continue
+            group = [ch0]
+            packed.add(ch0)
+            for chj, magj in candidates[i + 1 :]:
+                if len(group) >= PACK_MAX_GROUP:
+                    break
+                if chj not in packed and mag0 / max(magj, 1e-9) <= PACK_SIMILARITY_RATIO:
+                    group.append(chj)
+                    packed.add(chj)
+            groups.append(group)
+
+        real_groups = [g for g in groups if len(g) >= 2]
+        packed_members = {ch for g in real_groups for ch in g}
+        singleton_groups = [[ch] for ch in channels if ch not in packed_members]
+        tiers.append(real_groups + singleton_groups)
+    return tiers
+
+
 # --- Recordings list matching -------------------------------------------
 
 
@@ -625,7 +707,7 @@ class EmotivProUI:
         except (subprocess.CalledProcessError, ValueError):
             return None
 
-    def is_content_visible(self, frame: Optional[Frame] = None) -> bool:
+    def is_content_visible(self, frame: Optional[Frame] = None, n_curves: int = 1) -> bool:
         """Whether EmotivPRO's own content is genuinely on top and
         unobscured.
 
@@ -646,16 +728,30 @@ class EmotivProUI:
            stay clear, so check 1 alone passed the whole time) and
            produced a burst of repeated, wrong values in the output --
            traced to the digitizer finding "curve ink" in what was
-           actually terminal text. A real EEG curve, however busy, is a
-           thin trace across a mostly-blank canvas (confirmed live:
-           <0.3% of plot pixels count as ink even with a live signal
-           drawn); dense text/UI from an occluding window fills a
+           actually terminal text. A single real EEG curve, however
+           busy, is a thin trace across a mostly-blank canvas (confirmed
+           live: <0.3% of plot pixels count as ink even with a live
+           signal drawn); dense text/UI from an occluding window fills a
            double-digit percentage instead -- an easy, wide-margin
-           separation. Skipped (not a failure) if the plot canvas can't
-           be located at all, since check_content is only ever enabled
-           while already in a chart view where it should always be
-           findable -- treat that as its own instability instead via
-           the fixed-geometry check below."""
+           separation for ONE curve.
+
+           `n_curves` scales that budget for --channel-packing's 2-4
+           overlaid curves: confirmed live on a real packed 4-channel
+           capture (O1/T8/FC6/F4, nothing occluding it) that genuine ink
+           density reached 8.25% -- above the single-curve 8% cutoff, a
+           false "occluded" trip on a perfectly normal packed frame (4
+           busy, full-range, mutually-crossing curves cover much more
+           than 4x a single thin trace's share, since they also cross
+           each other). Scaled linearly per curve instead of a single
+           fixed cutoff: still a wide margin under real occlusion's
+           double-digit percentage even at n_curves=PACK_MAX_GROUP, but
+           no longer trips on legitimate packed density.
+
+           Skipped (not a failure) if the plot canvas can't be located
+           at all, since check_content is only ever enabled while
+           already in a chart view where it should always be findable --
+           treat that as its own instability instead via the
+           fixed-geometry check below."""
         f = frame if frame is not None else self.frame()
         patch = f.rgb[390:410, 10:20].reshape(-1, 3).astype(np.int32)
         mean = patch.mean(axis=0)
@@ -664,7 +760,7 @@ class EmotivProUI:
         bounds = find_plot_bounds(f)
         if bounds is not None and bounds.width > 0 and bounds.height > 0:
             plot_rgb = f.rgb[bounds.y0 : bounds.y1, bounds.x0 : bounds.x1]
-            if find_lone_curve_pixels(plot_rgb).mean() > 0.08:
+            if find_lone_curve_pixels(plot_rgb).mean() > 0.08 * max(1, n_curves):
                 return False
         return True
 
@@ -682,7 +778,7 @@ class EmotivProUI:
             self._last_geo = None
 
     def is_stable(
-        self, check_pointer: bool = True, check_focus: bool = True, check_content: bool = False
+        self, check_pointer: bool = True, check_focus: bool = True, check_content: bool = False, n_curves: int = 1
     ) -> Tuple[bool, str]:
         """The concrete, checkable version of "is the user doing
         something right now": the EmotivPRO window still exists at the
@@ -732,7 +828,7 @@ class EmotivProUI:
         size = (geo.width, geo.height)
         if self._last_geo is not None and size != self._last_geo:
             return False, f"the EmotivPRO window was resized ({self._last_geo} -> {size})"
-        if check_content and not self.is_content_visible():
+        if check_content and not self.is_content_visible(n_curves=n_curves):
             return False, "EmotivPRO's content is no longer clearly visible (something else is drawn over it)"
         if check_focus:
             active = self._active_window_id()
@@ -743,9 +839,11 @@ class EmotivProUI:
         return True, ""
 
     def require_stable(
-        self, check_pointer: bool = True, check_focus: bool = True, check_content: bool = False
+        self, check_pointer: bool = True, check_focus: bool = True, check_content: bool = False, n_curves: int = 1
     ) -> None:
-        ok, reason = self.is_stable(check_pointer=check_pointer, check_focus=check_focus, check_content=check_content)
+        ok, reason = self.is_stable(
+            check_pointer=check_pointer, check_focus=check_focus, check_content=check_content, n_curves=n_curves
+        )
         if not ok:
             raise Disruption(reason)
 
@@ -878,6 +976,27 @@ class EmotivProUI:
         f = self.frame()
         if not self._checkbox_checked(f, cx, cy):
             raise RuntimeError(f"clicking {channel}'s checkbox did not check it")
+        self.close_panel_if_open(tab)
+
+    def add_to_selection(self, tab: str, extra_channels: List[str], channels: List[str]) -> None:
+        """Checks each of `extra_channels` IN ADDITION to whatever's
+        already checked, without touching the existing selection --
+        the second half of a packed (--channel-packing) group's
+        selection. Split out from select_only (rather than a single
+        select_group doing both halves) specifically so the caller can
+        set High-pass in between, on the single-channel selection
+        select_only leaves behind, before it locks (see
+        PACKED_AMPLITUDE_UV's comment: EmotivPRO locks both Amplitude
+        AND High-pass the instant a 2nd box gets checked)."""
+        ex, ey = self._eye_pos(tab)
+        self.xdo.click(ex, ey, settle=0.3)
+        positions = self._checkbox_positions(tab, channels)
+        for ch in extra_channels:
+            cx, cy = positions[ch]
+            self.xdo.click(cx, cy, settle=0.3)
+            f = self.frame()
+            if not self._checkbox_checked(f, cx, cy):
+                raise RuntimeError(f"clicking {ch}'s checkbox did not check it (packed group)")
         self.close_panel_if_open(tab)
 
     def _set_field(self, pos: Tuple[int, int], value: float) -> None:
@@ -1050,6 +1169,56 @@ def motion_plot_bounds(frame: Frame) -> Optional[PlotBounds]:
     return PlotBounds(x0, y0, x1, y1)
 
 
+def _chrome_exclusion_mask(h: int, w: int) -> np.ndarray:
+    """Boolean (h, w) mask, True where EmotivPRO's own chart chrome
+    (the X-axis baseline, and the floated clock/HRS/eye icon cluster in
+    the top-right corner) lives, independent of which channel(s) are on
+    screen or how they're told apart -- shared by find_lone_curve_pixels
+    (single curve, "any ink" detection) and digitize_group_capture's
+    packed path (multiple curves, per-channel COLOR detection): the
+    axis line and corner icons are static UI, not curve ink, regardless
+    of which detection method is looking at them.
+
+    Excludes from the X-axis line's own row (confirmed live a near-solid
+    row lives at row ~0.988h, ~97% of columns "ink," one fixed pixel
+    value across a whole run) all the way down to the canvas's bottom
+    edge, NOT just a narrow band centered on it -- confirmed live/traced
+    from a real run that a +/-6px band left rows just past its lower
+    edge (axis_row+6, +7) un-excluded, and those rows still carry the
+    axis line's own antialiased fringe (dark enough to cross the ink
+    threshold). Whenever the real curve has no ink of its own in a
+    column -- common on a channel whose raw signal often sits outside
+    the visible range -- that fringe won the column by default,
+    fabricating a near-constant, boundary-adjacent value with no basis
+    in the original log or in EmotivPRO's own live plot at that moment
+    (confirmed against real output: rows axis_row+6/+7 decoded to
+    -148.216/-148.541 uV at one real pass's amplitude range, recurring
+    exactly, hundreds of times). A curve that's TRULY clipped at amp_min
+    renders essentially coincident with the axis line's own row in the
+    first place (there's nowhere further down for it to go), so it was
+    never reliably separable from the axis line by position anyway --
+    losing that sliver to None (never fabricating a value for it) is
+    the safe failure mode, consistent with every other digitizer in
+    this project.
+
+    Also suppresses the top-right corner where EmotivPRO floats its own
+    chrome (clock-format toggle, "HRS", hide-channels eye icon) ON TOP
+    of the plot canvas -- confirmed live via a live capture: rows 2-35
+    within the rightmost ~10% of the canvas read 25-49% ink there from
+    that chrome alone, dropping to exactly 0 right at row 36, confirmed
+    at column resolution. This corner is exactly where the Stitcher's
+    per-capture "new" tail lands (the rightmost/most-recent columns), so
+    any capture where the real curve happened to be absent there had
+    nothing else to stop these icons from winning by default --
+    confirmed live this fabricated a second, separate, repeated wrong
+    value distinct from the axis-line one."""
+    mask = np.zeros((h, w), dtype=bool)
+    axis_row = int(0.988 * h)
+    mask[max(0, axis_row - 6) :, :] = True
+    mask[: int(0.039 * h), int(0.90 * w) :] = True
+    return mask
+
+
 def find_lone_curve_pixels(plot_rgb: np.ndarray) -> np.ndarray:
     """Boolean (h, w) mask of "curve ink" pixels for a plot with exactly
     one visible curve -- unlike epoc_graph.classify_plot_pixels (which
@@ -1073,48 +1242,7 @@ def find_lone_curve_pixels(plot_rgb: np.ndarray) -> np.ndarray:
     # (digitize_curve just needs the row's ink centroid, not every pixel).
     match = dist_from_white > 45
     h, w = match.shape
-    # Suppress a narrow band right at the bottom of the canvas: confirmed
-    # live a near-solid row lives there (~97% of columns "ink," one
-    # fixed pixel value across the whole run) -- the plot's own X-axis
-    # baseline, NOT the curve. With digitize_curve's lone-curve search
-    # spanning the full canvas height (no neighboring channel to avoid,
-    # so nothing else restricts it -- see digitize_lone_curve_capture),
-    # any column where the real curve is genuinely absent had nothing to
-    # stop this line winning by default, confirmed live to fabricate a
-    # long, exactly-repeated, boundary-adjacent value with no basis in
-    # the original log's own data for that same span.
-    #
-    # Deliberately narrow and POSITION-based (not a row-wide ink-density
-    # threshold, which was tried first and reverted): this data is from
-    # a real "low-quality" recording where a badly-contacted electrode
-    # genuinely rails against its clipping boundary for extended
-    # stretches -- confirmed live that a density threshold generous
-    # enough to spare that real, flat, clipped curve was already above
-    # where the axis line needed to sit to be excluded, and a threshold
-    # tight enough to catch the axis line instead blanked out ~99% of a
-    # whole pass's genuinely-clipped-but-real data. Position doesn't have
-    # that conflict: the axis line sits at one fixed row regardless of
-    # channel or amplitude range, comfortably inboard of where a curve
-    # actually clipped at amp_min would render (the true bottom edge),
-    # so excluding only a narrow band around the line's own row leaves
-    # genuine edge-clipped data alone.
-    axis_row = int(0.988 * h)
-    match[max(0, axis_row - 6) : axis_row + 6, :] = False
-    # Suppress the top-right corner where EmotivPRO floats its own
-    # chrome (clock-format toggle, "HRS", hide-channels eye icon) ON TOP
-    # of the plot canvas, inside `bounds` -- confirmed live via a live
-    # capture: rows 2-35 within the rightmost ~10% of the canvas read
-    # 25-49% ink there from that chrome alone, dropping to exactly 0
-    # right at row 36, confirmed at column resolution -- narrow and
-    # position-based like the axis-line band above, for the same reason
-    # (a real clipped-near-the-top curve is expected and must survive
-    # this, not just static UI chrome). This corner is exactly where the
-    # Stitcher's per-capture "new" tail lands (the rightmost/most-recent
-    # columns), so any capture where the real curve happened to be
-    # absent there had nothing else to stop these icons from winning by
-    # default -- confirmed live this fabricated a second, separate,
-    # repeated wrong value distinct from the axis-line one.
-    match[: int(0.039 * h), int(0.90 * w) :] = False
+    match &= ~_chrome_exclusion_mask(h, w)
     return match
 
 
@@ -1196,21 +1324,142 @@ def digitize_lone_curve_capture(
     return out
 
 
+def calibrate_group_colors(frame: Frame, channel_group: List[str]) -> Dict[str, Optional[Tuple[int, int, int]]]:
+    """Calibrates each PACKED channel's (see --channel-packing) curve
+    color from its legend label, the same "modal non-white color of the
+    name text" trick epoc_graph.calibrate_channel_colors uses for the
+    live 14-channel view -- but that function locates each label by the
+    channel's own baseline row, which only holds in the live view's
+    per-channel STACKED layout (non-zero spacing). A packed capture
+    always has spacing 0 (2-4 curves overlaid on one shared scale,
+    forced -- see PACKED_AMPLITUDE_UV), so the legend column instead
+    lists exactly the selected channels top-to-bottom in the SAME fixed
+    master CHANNELS order the eye-panel's own checkbox grid uses
+    (confirmed live across two different packed groups: e.g. F3 (index
+    2) listed above FC5 (index 3); FC5 above AF4 (index 13), regardless
+    of click order), evenly spaced -- NOT at each channel's own curve
+    position. So: find every distinct colored (non-white) text blob in
+    the legend column by row, sort those blobs top-to-bottom, and zip
+    them with channel_group sorted into CHANNELS order -- positional,
+    not row-matched."""
+    from epoc_graph import CHANNELS, LEGEND_TEXT_X0_FROM_RIGHT_PX, LEGEND_TEXT_X1_FROM_RIGHT_PX, _modal_color
+
+    text_x0 = frame.width - LEGEND_TEXT_X0_FROM_RIGHT_PX
+    text_x1 = frame.width - LEGEND_TEXT_X1_FROM_RIGHT_PX
+    column = frame.rgb[:, text_x0:text_x1]
+    ordered = sorted(channel_group, key=lambda ch: CHANNELS.index(ch))
+
+    r = column[:, :, 0].astype(np.int32)
+    g = column[:, :, 1].astype(np.int32)
+    b = column[:, :, 2].astype(np.int32)
+    dist_from_white = (255 - r) + (255 - g) + (255 - b)
+    rows_with_ink = np.where(dist_from_white.max(axis=1) > 30)[0]
+    if rows_with_ink.size == 0:
+        return {ch: None for ch in ordered}
+
+    # Split into contiguous row bands, one per label (a real gap between
+    # two different channels' legend rows is tens of pixels at least;
+    # >3 comfortably separates that from any single glyph's own
+    # internal row-to-row ink continuity).
+    splits = np.where(np.diff(rows_with_ink) > 3)[0]
+    bands = np.split(rows_with_ink, splits + 1)
+
+    colors: Dict[str, Optional[Tuple[int, int, int]]] = {}
+    for i, ch in enumerate(ordered):
+        if i >= len(bands):
+            colors[ch] = None
+            continue
+        y0, y1 = int(bands[i].min()), int(bands[i].max()) + 1
+        patch = column[y0:y1].reshape(-1, 3)
+        colors[ch] = _modal_color(patch)
+    return colors
+
+
+def digitize_group_capture(
+    frame: Frame,
+    bounds: PlotBounds,
+    channel_group: List[str],
+    amp_min: float,
+    amp_max: float,
+    reference_ts_ns: int,
+) -> List[Tuple[int, Dict[str, Optional[float]]]]:
+    """Like digitize_lone_curve_capture, but for a --channel-packing
+    group of 1-4 channels sharing one overlaid plot. A singleton group
+    is just digitize_lone_curve_capture wrapped in the same
+    per-timestamp channel->value dict shape CaptureResult.samples
+    already expects everywhere else, so the unpacked path's actual
+    digitized values are byte-for-byte what they'd be without
+    --channel-packing at all -- zero behavior change there.
+
+    2+ channels share the SAME baseline/scale (spacing is always 0 in a
+    packed view, unlike the live 14-channel view's per-channel stacked
+    rows), so they're told apart the same way the live view tells its
+    14 simultaneous curves apart -- by color (see
+    epoc_graph.classify_plot_pixels) -- not by position. The shared
+    chrome exclusion (_chrome_exclusion_mask) is applied here too: color
+    matching alone is already unlikely to confuse the axis line or
+    corner icons for a channel's own (distinctly hued) curve color, but
+    it's cheap insurance against the same failure mode
+    find_lone_curve_pixels had to close."""
+    if len(channel_group) == 1:
+        samples = digitize_lone_curve_capture(frame, bounds, amp_min, amp_max, reference_ts_ns)
+        return [(ts, {channel_group[0]: v}) for ts, v in samples]
+
+    from epoc_graph import classify_plot_pixels, digitize_curve, pixel_to_seconds_ago
+
+    plot_rgb = frame.rgb[bounds.y0 : bounds.y1, bounds.x0 : bounds.x1]
+    h, w = bounds.height, bounds.width
+    colors = calibrate_group_colors(frame, channel_group)
+    match_masks = classify_plot_pixels(plot_rgb, colors)
+    excluded = _chrome_exclusion_mask(h, w)
+    for ch in match_masks:
+        match_masks[ch] = match_masks[ch] & ~excluded
+
+    baseline_local = h * (amp_max / (amp_max - amp_min))
+    uv_per_px = h / (amp_max - amp_min)
+    tick_calibration = read_axis_tick_labels(frame, bounds)
+
+    per_channel_rows: Dict[str, List[Optional[int]]] = {
+        ch: digitize_curve(match_masks.get(ch, np.zeros((h, w), dtype=bool)), baseline_local, h)
+        for ch in channel_group
+    }
+
+    out: List[Tuple[int, Dict[str, Optional[float]]]] = []
+    for col in range(w):
+        x_abs = bounds.x0 + col
+        seconds_ago = pixel_to_seconds_ago(x_abs, bounds, tick_calibration)
+        ts_ns = reference_ts_ns - int(seconds_ago * 1e9)
+        row_values: Dict[str, Optional[float]] = {}
+        for ch in channel_group:
+            y = per_channel_rows[ch][col]
+            row_values[ch] = None if y is None else float(amp_max - y / uv_per_px)
+        out.append((ts_ns, row_values))
+    out.sort(key=lambda s: s[0])
+    return out
+
+
 def run_one_pass(
     ui: EmotivProUI,
     matched: "RecordingRow",
     tab: str,
-    channel: str,
+    channel_group: List[str],
     channels: List[str],
     amp_min: Optional[float],
     amp_max: Optional[float],
     hp: Optional[bool],
     max_duration_s: Optional[float],
     poll_interval: float,
-    out_path: str,
+    out_paths: Dict[str, str],
     verbose: bool,
     recording_start_ns: Optional[int] = None,
-) -> List[Tuple[int, Optional[float]]]:
+) -> Dict[str, List[Tuple[int, Optional[float]]]]:
+    """Runs one capture pass for `channel_group` -- a single channel
+    (the original, unpacked behavior) or, with --channel-packing, 2-4
+    channels sharing one overlaid EmotivPRO plot (see
+    digitize_group_capture, select_group's comment on
+    PACKED_AMPLITUDE_UV). `out_paths` has one entry per member of
+    channel_group; every member is written to, timestamp-aligned,
+    from the SAME underlying captures."""
     from epoc_graph import Stitcher
 
     # Re-opening the recording is the FIRST thing every pass does, not
@@ -1225,7 +1474,7 @@ def run_one_pass(
     ui.ensure_paused()
     ui.seek_to_start()
     ui.click_icon(tab)
-    ui.select_only(tab, channel, channels)
+    ui.select_only(tab, channel_group[0], channels)
     if tab == "eeg":
         # High-pass FIRST, amplitude SECOND -- confirmed live (the hard
         # way) that toggling High-pass filter changes/resets the
@@ -1235,9 +1484,21 @@ def run_one_pass(
         # version did -- reliably left the Amplitude fields showing
         # garbage relative to what was just set, 5/5 times reproduced,
         # every time high-pass needed to be toggled off from its
-        # checked-by-default state.
+        # checked-by-default state. For a packed group this ordering
+        # matters even more: High-pass is only settable at all while
+        # channel_group[0] is still the sole checked box (see
+        # PACKED_AMPLITUDE_UV's comment -- it locks, same as Amplitude,
+        # the instant a 2nd box joins).
         ui.set_high_pass(bool(hp))
-        ui.set_amplitude(amp_min, amp_max)
+        if len(channel_group) == 1:
+            ui.set_amplitude(amp_min, amp_max)
+        # Packed groups never call set_amplitude: EmotivPRO forces
+        # +/-PACKED_AMPLITUDE_UV the instant the rest of the group gets
+        # checked below regardless of what's typed, so amp_min/amp_max
+        # here are just the (already-forced) calibration constants
+        # digitize_group_capture uses, not something to type in.
+    if len(channel_group) > 1:
+        ui.add_to_selection(tab, channel_group[1:], channels)
     # Belt-and-suspenders: select_only already verifies the panel it
     # opened gets closed, but re-check right before playing regardless
     # (cheap, and this is exactly the thing that silently wasted a full
@@ -1257,7 +1518,7 @@ def run_one_pass(
     bounds_fn = find_plot_bounds if tab == "eeg" else motion_plot_bounds
     value_col = "value_uv" if tab == "eeg" else "value_frac_of_visible_range"
 
-    # Written to a .tmp path and only renamed to out_path once the pass
+    # Written to .tmp paths and only renamed to out_paths once the pass
     # completes -- this is what lets main() treat "out_path already
     # exists" as "this pass is done, skip it" and safely resume a run
     # that was stopped and re-invoked (each pass is one continuous
@@ -1276,11 +1537,18 @@ def run_one_pass(
     # progress on every restart. "Roughly" is fine: a few seconds of
     # re-captured overlap is cheap, and Stitcher's timestamp dedup (seeded
     # with the last row already written) cleanly drops it.
-    tmp_path = out_path + ".tmp"
+    #
+    # For a packed group, resume progress is tracked off channel_group[0]'s
+    # own .tmp file only (all members are written from the same capture
+    # stream, so they progress together) -- a group resumes as a whole
+    # or restarts as a whole, rather than each member tracking its own
+    # offset separately.
+    tmp_paths = {ch: out_paths[ch] + ".tmp" for ch in channel_group}
+    lead_tmp_path = tmp_paths[channel_group[0]]
     resume_from_ns: Optional[int] = None
-    if recording_start_ns is not None and max_duration_s and os.path.exists(tmp_path):
+    if recording_start_ns is not None and max_duration_s and os.path.exists(lead_tmp_path):
         try:
-            with open(tmp_path, newline="") as rf:
+            with open(lead_tmp_path, newline="") as rf:
                 reader = csv.reader(rf)
                 next(reader, None)
                 last_ts = None
@@ -1297,31 +1565,36 @@ def run_one_pass(
     if resume_from_ns is not None:
         elapsed_s = (resume_from_ns - recording_start_ns) / 1e9
         if verbose:
-            sys.stderr.write(f"[pass] resuming {channel} at ~{elapsed_s:.0f}s/{max_duration_s:.0f}s (was {tmp_path})\n")
+            sys.stderr.write(f"[pass] resuming {channel_group} at ~{elapsed_s:.0f}s/{max_duration_s:.0f}s (was {lead_tmp_path})\n")
         ui.seek_to_fraction(elapsed_s / max_duration_s)
     else:
         ui.seek_to_start()
     ui.play()
 
-    stitcher = Stitcher(verbose=verbose, channels=[channel])
+    stitcher = Stitcher(verbose=verbose, channels=channel_group)
     if resume_from_ns is not None:
         stitcher.last_emitted_ts_ns = resume_from_ns
-    all_samples: List[Tuple[int, Optional[float]]] = []
+    all_samples: Dict[str, List[Tuple[int, Optional[float]]]] = {ch: [] for ch in channel_group}
     file_mode = "a" if resume_from_ns is not None else "w"
-    with open(tmp_path, file_mode, newline="") as f:
-        writer = csv.writer(f)
+    files = {ch: open(tmp_paths[ch], file_mode, newline="") for ch in channel_group}
+    try:
+        writers = {ch: csv.writer(f) for ch, f in files.items()}
         if file_mode == "w":
-            writer.writerow(["timestamp_ns", "timestamp_iso", value_col])
-        f.flush()
+            for w in writers.values():
+                w.writerow(["timestamp_ns", "timestamp_iso", value_col])
+        for f in files.values():
+            f.flush()
 
         class _RowWriter:
             def write_row(self, ts_ns, values, quality):
-                v = values.get(channel)
-                writer.writerow([ts_ns, _iso_ns(ts_ns), "" if v is None else f"{v:.3f}"])
-                all_samples.append((ts_ns, v))
+                for ch, w in writers.items():
+                    v = values.get(ch)
+                    w.writerow([ts_ns, _iso_ns(ts_ns), "" if v is None else f"{v:.3f}"])
+                    all_samples[ch].append((ts_ns, v))
 
             def flush(self):
-                f.flush()
+                for f in files.values():
+                    f.flush()
 
         row_writer = _RowWriter()
         safety_cap_s = (max_duration_s + max(10.0, poll_interval * 3)) if max_duration_s else DEFAULT_MAX_DURATION_S
@@ -1360,7 +1633,7 @@ def run_one_pass(
             # change, and focus can flap without occlusion), and we're
             # definitely in the chart view here so its assumption holds.
             try:
-                ui.require_stable(check_pointer=False, check_focus=False, check_content=True)
+                ui.require_stable(check_pointer=False, check_focus=False, check_content=True, n_curves=len(channel_group))
             except Disruption:
                 # Freeze the video the INSTANT a disruption is noticed,
                 # not just epoc-reread's own reading of it -- confirmed
@@ -1422,12 +1695,16 @@ def run_one_pass(
                         reference_ts_ns = recording_start_ns + int((time.monotonic() - pass_start) * 1e9)
                     else:
                         reference_ts_ns = frame.capture_ts_ns
-                    samples = digitize_lone_curve_capture(frame, bounds, amp_min, amp_max, reference_ts_ns)
+                    if tab == "eeg":
+                        samples = digitize_group_capture(frame, bounds, channel_group, amp_min, amp_max, reference_ts_ns)
+                    else:
+                        lone = digitize_lone_curve_capture(frame, bounds, amp_min, amp_max, reference_ts_ns)
+                        samples = [(ts, {channel_group[0]: v}) for ts, v in lone]
                     from epoc_graph import CaptureResult
 
                     result = CaptureResult(
                         capture_ts_ns=reference_ts_ns,
-                        samples=[(ts, {channel: v}) for ts, v in samples],
+                        samples=samples,
                         quality={},
                         window_width=frame.width,
                     )
@@ -1436,14 +1713,18 @@ def run_one_pass(
             sleep_for = poll_interval - (time.monotonic() - t0)
             if sleep_for > 0:
                 time.sleep(sleep_for)
+    finally:
+        for f in files.values():
+            f.close()
     try:
         ui.ensure_paused()
     except (RuntimeError, Disruption):
-        # The data is already flushed to tmp_path -- a failure here is
-        # just tidiness (leaving the video playing), not worth losing
-        # and re-running an otherwise-complete pass over.
+        # The data is already flushed to the .tmp files -- a failure
+        # here is just tidiness (leaving the video playing), not worth
+        # losing and re-running an otherwise-complete pass over.
         pass
-    os.replace(tmp_path, out_path)
+    for ch in channel_group:
+        os.replace(tmp_paths[ch], out_paths[ch])
     return all_samples
 
 
@@ -1454,48 +1735,50 @@ def run_pass_with_recovery(
     ui: EmotivProUI,
     matched: "RecordingRow",
     tab: str,
-    channel: str,
+    channel_group: List[str],
     channels: List[str],
     amp_min: Optional[float],
     amp_max: Optional[float],
     hp: Optional[bool],
     max_duration_s: Optional[float],
     poll_interval: float,
-    out_path: str,
+    out_paths: Dict[str, str],
     verbose: bool,
     recording_start_ns: Optional[int] = None,
-) -> List[Tuple[int, Optional[float]]]:
-    """Wraps one run_one_pass call with disruption recovery: if the UI
-    turns out to already be unstable before starting, or run_one_pass
-    aborts partway through (a Disruption raised by its own periodic
-    ui.require_stable() checks, or one of EmotivProUI's existing
-    "clicking X didn't produce Y" RuntimeErrors -- both mean something
-    other than epoc-reread touched the UI), this pauses for the user to
-    confirm it's safe, then restarts the ENTIRE pass from scratch
-    (open_recording -> ... -> play) rather than trying to resume
-    mid-pass, since there's no way to know what a human left on screen.
-    Never runs unattended for longer than one pass without a chance to
-    notice something went wrong."""
+) -> Dict[str, List[Tuple[int, Optional[float]]]]:
+    """Wraps one run_one_pass call (a single channel, or with
+    --channel-packing a 2-4 channel group -- see channel_group) with
+    disruption recovery: if the UI turns out to already be unstable
+    before starting, or run_one_pass aborts partway through (a
+    Disruption raised by its own periodic ui.require_stable() checks,
+    or one of EmotivProUI's existing "clicking X didn't produce Y"
+    RuntimeErrors -- both mean something other than epoc-reread touched
+    the UI), this pauses for the user to confirm it's safe, then
+    restarts the ENTIRE pass from scratch (open_recording -> ... ->
+    play) rather than trying to resume mid-pass, since there's no way
+    to know what a human left on screen. Never runs unattended for
+    longer than one pass without a chance to notice something went
+    wrong."""
     for attempt in range(1, MAX_PASS_RETRIES + 1):
         ok, reason = ui.is_stable()
         if not ok:
             ui.pause_for_confirmation(reason)
         try:
             return run_one_pass(
-                ui, matched, tab, channel, channels, amp_min, amp_max, hp,
-                max_duration_s, poll_interval, out_path, verbose,
+                ui, matched, tab, channel_group, channels, amp_min, amp_max, hp,
+                max_duration_s, poll_interval, out_paths, verbose,
                 recording_start_ns=recording_start_ns,
             )
         except Disruption as e:
-            sys.stderr.write(f"[disrupted] {channel}: {e} (attempt {attempt}/{MAX_PASS_RETRIES})\n")
+            sys.stderr.write(f"[disrupted] {channel_group}: {e} (attempt {attempt}/{MAX_PASS_RETRIES})\n")
             ui.pause_for_confirmation(str(e))
         except RuntimeError as e:
             sys.stderr.write(
-                f"[disrupted] {channel}: a UI verification step failed ({e}) -- "
+                f"[disrupted] {channel_group}: a UI verification step failed ({e}) -- "
                 f"treating as a disruption (attempt {attempt}/{MAX_PASS_RETRIES})\n"
             )
             ui.pause_for_confirmation(str(e))
-    raise RuntimeError(f"{channel}: gave up after {MAX_PASS_RETRIES} disrupted attempts")
+    raise RuntimeError(f"{channel_group}: gave up after {MAX_PASS_RETRIES} disrupted attempts")
 
 
 # --- Common-timespan report ------------------------------------------------
@@ -1751,6 +2034,17 @@ def main() -> None:
     parser.add_argument("--motion-too", action="store_true", help="also re-read the 10 Motion sensors (Q0-3, ACCX/Y/Z, MAGX/Y/Z), one autoscaled pass each")
     parser.add_argument("--channels", type=parse_channels_arg, default=None, help="comma-separated subset of EEG channels to re-read (default: all 14)")
     parser.add_argument(
+        "--channel-packing", action=argparse.BooleanOptionalAction, default=True,
+        help="at each zoom-level tier, re-read up to %d channels together in ONE pass (instead of "
+        "one pass each) whenever their planned amp_min/amp_max for that tier are within "
+        "%gx of each other AND fit inside +/-%guV -- EmotivPRO only lets the Amplitude fields "
+        "be set while exactly one channel is checked; the instant a 2nd is added it forces "
+        "+/-%guV and locks both Amplitude and High-pass (confirmed live), so packing only ever "
+        "helps channels whose own target was already close to that. On by default; pass "
+        "--no-channel-packing for the original one-channel-per-pass behavior."
+        % (PACK_MAX_GROUP, PACK_SIMILARITY_RATIO, PACKED_AMPLITUDE_UV, PACKED_AMPLITUDE_UV),
+    )
+    parser.add_argument(
         "--recording-index", type=int, default=None,
         help="skip automatic (OCR-based, best-effort only) matching; use the Nth row (1-based, "
         "from the top as currently sorted/displayed) in the Recordings list instead",
@@ -1896,26 +2190,33 @@ def main() -> None:
 
     n_levels = max(1, int(args.realtime_budget))
     hp_multiplier = 2 if args.with_high_pass else 1
-    total_passes = len(channels) * n_levels * hp_multiplier + (len(MOTION_CHANNELS) if args.motion_too else 0)
-    duration_known = matched.duration_s is not None
-    duration_str = f"{matched.duration_s:.0f}s" if duration_known else f"unknown (safety cap {DEFAULT_MAX_DURATION_S/3600:.0f}h/pass)"
-    if duration_known:
-        est_seconds = total_passes * matched.duration_s
-        print(f"Matched recording: row {matched.row_index}, duration {duration_str}")
-        print(f"Planned passes: {total_passes} (~{est_seconds/3600:.1f}h estimated)")
-    else:
-        print(f"Matched recording: row {matched.row_index}, duration {duration_str}")
-        print(f"Planned passes: {total_passes} (duration unknown -- can't estimate total time)")
+
+    levels_by_channel: Dict[str, List[Tuple[float, float, str]]] = {}
     for ch in channels:
         st = stats_by_channel.get(ch)
         if st is None:
             print(f"  {ch}: no observed values in log -- will use floor-only wide range")
-            levels = plan_zoom_levels(
-                LogChannelStats(0.0, -10.0, 10.0, 0), args.realtime_budget, args.wide_factor, DEFAULT_WIDE_FLOOR_UV
-            )
-        else:
-            levels = plan_zoom_levels(st, args.realtime_budget, args.wide_factor, DEFAULT_WIDE_FLOOR_UV)
-        print(f"  {ch}: " + ", ".join(f"{tag}[{lo:.0f},{hi:.0f}]" for lo, hi, tag in levels))
+            st = LogChannelStats(0.0, -10.0, 10.0, 0)
+        levels_by_channel[ch] = plan_zoom_levels(st, args.realtime_budget, args.wide_factor, DEFAULT_WIDE_FLOOR_UV)
+        print(f"  {ch}: " + ", ".join(f"{tag}[{lo:.0f},{hi:.0f}]" for lo, hi, tag in levels_by_channel[ch]))
+
+    if args.channel_packing:
+        tier_groups = plan_channel_packs(channels, levels_by_channel, n_levels)
+    else:
+        tier_groups = [[[ch] for ch in channels] for _ in range(n_levels)]
+    n_eeg_passes = sum(len(groups) for groups in tier_groups) * hp_multiplier
+    total_passes = n_eeg_passes + (len(MOTION_CHANNELS) if args.motion_too else 0)
+    n_packed_groups = sum(1 for groups in tier_groups for g in groups if len(g) > 1)
+
+    duration_known = matched.duration_s is not None
+    duration_str = f"{matched.duration_s:.0f}s" if duration_known else f"unknown (safety cap {DEFAULT_MAX_DURATION_S/3600:.0f}h/pass)"
+    print(f"Matched recording: row {matched.row_index}, duration {duration_str}")
+    packing_note = f", {n_packed_groups} of them packed 2-4 channels/pass" if args.channel_packing and n_packed_groups else ""
+    if duration_known:
+        est_seconds = total_passes * matched.duration_s
+        print(f"Planned passes: {total_passes}{packing_note} (~{est_seconds/3600:.1f}h estimated)")
+    else:
+        print(f"Planned passes: {total_passes}{packing_note} (duration unknown -- can't estimate total time)")
 
     if args.dry_run:
         return
@@ -1926,43 +2227,56 @@ def main() -> None:
     # to re-parse filenames.
     eeg_pass_files: Dict[str, List[Tuple[float, str]]] = {ch: [] for ch in channels}
 
-    for ch in channels:
-        st = stats_by_channel.get(ch) or LogChannelStats(0.0, -10.0, 10.0, 0)
-        levels = plan_zoom_levels(st, args.realtime_budget, args.wide_factor, DEFAULT_WIDE_FLOOR_UV)
-        hp_states = (False, True) if args.with_high_pass else (False,)
-        for amp_min, amp_max, tag in levels:
+    hp_states = (False, True) if args.with_high_pass else (False,)
+    for t in range(n_levels):
+        for group in tier_groups[t]:
+            if len(group) == 1:
+                amp_min, amp_max, tag = levels_by_channel[group[0]][t]
+            else:
+                # Packed: every member's own planned range for this
+                # tier is discarded in favor of the one range
+                # EmotivPRO actually applies to a multi-channel
+                # selection -- see PACKED_AMPLITUDE_UV.
+                tag = levels_by_channel[group[0]][t][2]
+                amp_min, amp_max = -PACKED_AMPLITUDE_UV, PACKED_AMPLITUDE_UV
             range_tag = tag_for_range(amp_min, amp_max) if tag != "wide" else "auto"
             for hp in hp_states:
                 suffix = ".hp" if hp else ""
-                out_path = os.path.join(args.output_dir, f"{basename}.{ch}.{range_tag}{suffix}")
-                if os.path.exists(out_path):
-                    # Resuming a run stopped and re-invoked earlier (this
-                    # script must be run attended/foreground -- see the
-                    # module docstring -- so a multi-hour run is expected
-                    # to span several separate invocations): a pass file
-                    # only ever exists at its final name once fully
-                    # written (run_one_pass writes to out_path+".tmp" and
-                    # renames only on completion), so its presence alone
-                    # means this exact pass is already done.
-                    sys.stderr.write(f"[skip] {ch} [{amp_min},{amp_max}] hp={hp} -> {out_path} (already done)\n")
-                    samples = read_value_csv(out_path)
+                out_paths = {ch: os.path.join(args.output_dir, f"{basename}.{ch}.{range_tag}{suffix}") for ch in group}
+                # Resuming a run stopped and re-invoked earlier (this
+                # script must be run attended/foreground -- see the
+                # module docstring -- so a multi-hour run is expected
+                # to span several separate invocations): a pass file
+                # only ever exists at its final name once fully
+                # written (run_one_pass writes to out_path+".tmp" and
+                # renames only on completion), so its presence alone
+                # means this exact pass is already done. For a packed
+                # group this is all-or-nothing: if even one member's
+                # file is missing, the whole group (all members share
+                # one capture stream) is re-read together.
+                if all(os.path.exists(p) for p in out_paths.values()):
+                    sys.stderr.write(f"[skip] {group} [{amp_min},{amp_max}] hp={hp} -> {list(out_paths.values())} (already done)\n")
+                    samples_by_ch = {ch: read_value_csv(p) for ch, p in out_paths.items()}
                 else:
-                    sys.stderr.write(f"[pass] {ch} [{amp_min},{amp_max}] hp={hp} -> {out_path}\n")
+                    sys.stderr.write(f"[pass] {group} [{amp_min},{amp_max}] hp={hp} -> {list(out_paths.values())}\n")
                     # NOTE: the channel-selector panel always shows all 14
                     # EEG channels regardless of --channels, so its
                     # checkbox GRID POSITIONS must be built from the full
                     # CHANNELS list here, not the (possibly narrower)
-                    # requested subset -- only `ch` itself (which one to
-                    # isolate) depends on --channels.
-                    samples = run_pass_with_recovery(
-                        ui, matched, "eeg", ch, CHANNELS, amp_min, amp_max, hp,
-                        matched.duration_s, args.poll_interval, out_path, args.verbose,
+                    # requested subset -- only `group` itself (which ones
+                    # to isolate) depends on --channels.
+                    samples_by_ch = run_pass_with_recovery(
+                        ui, matched, "eeg", group, CHANNELS, amp_min, amp_max, hp,
+                        matched.duration_s, args.poll_interval, out_paths, args.verbose,
                         recording_start_ns=recording_start_ns,
                     )
-                    clipped = any(v is not None and (abs(v - amp_max) < 1e-6 or abs(v - amp_min) < 1e-6) for _, v in samples)
-                    offset = cross_correlate_offset(samples, log.series.get(ch, []))
-                    append_match_report(report_path, ch, f"{range_tag}{suffix}", f"row{matched.row_index}", offset, clipped)
-                eeg_pass_files[ch].append((amp_max - amp_min, out_path))
+                    for ch in group:
+                        samples = samples_by_ch[ch]
+                        clipped = any(v is not None and (abs(v - amp_max) < 1e-6 or abs(v - amp_min) < 1e-6) for _, v in samples)
+                        offset = cross_correlate_offset(samples, log.series.get(ch, []))
+                        append_match_report(report_path, ch, f"{range_tag}{suffix}", f"row{matched.row_index}", offset, clipped)
+                for ch in group:
+                    eeg_pass_files[ch].append((amp_max - amp_min, out_paths[ch]))
 
     motion_pass_files: Dict[str, str] = {}
     if args.motion_too:
@@ -1972,12 +2286,12 @@ def main() -> None:
                 sys.stderr.write(f"[skip] motion {ch} -> {out_path} (already done)\n")
             else:
                 sys.stderr.write(f"[pass] motion {ch} -> {out_path}\n")
-                samples = run_pass_with_recovery(
-                    ui, matched, "motion", ch, MOTION_CHANNELS, None, None, None,
-                    matched.duration_s, args.poll_interval, out_path, args.verbose,
+                samples_by_ch = run_pass_with_recovery(
+                    ui, matched, "motion", [ch], MOTION_CHANNELS, None, None, None,
+                    matched.duration_s, args.poll_interval, {ch: out_path}, args.verbose,
                     recording_start_ns=recording_start_ns,
                 )
-                offset = cross_correlate_offset(samples, log.series.get(ch, []))
+                offset = cross_correlate_offset(samples_by_ch[ch], log.series.get(ch, []))
                 append_match_report(report_path, ch, "auto", f"row{matched.row_index}", offset, False)
             motion_pass_files[ch] = out_path
 
