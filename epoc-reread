@@ -1,0 +1,2016 @@
+#!/usr/bin/env python3
+"""Actively re-read an EmotivPRO recording at higher fidelity than the
+live multi-channel view `epoc-record` normally reads, by driving
+EmotivPRO's own replay UI (via simulated xdotool clicks) to isolate one
+electrode or motion sensor at a time.
+
+Given an `epoc-record` output log (plain or gzipped CSV, e.g.
+``log.20260814-1659.gz``), this script:
+
+1. Reads the log's overall time span and, per channel, its observed
+   value range (used to plan zoom levels -- see below).
+2. Finds the EmotivPRO window, navigates to the Recordings list, OCRs
+   each row's "Date Collected"/"Duration" cell, and picks the recording
+   whose time span overlaps the log's -- since `epoc-record`'s own
+   timestamps are only approximate (screen-OCR derived), this uses a
+   padded-overlap match, not exact equality.
+3. Opens that recording. For each electrode (and, with --motion-too,
+   each motion sensor), for each zoom level (EEG only) x high-pass
+   filter state (EEG only): rewinds to the start, isolates that one
+   channel via the eye/"Show or hide channel" panel, sets the Amplitude
+   min/max fields (EEG) or leaves it autoscaled (Motion, which has no
+   such fields at all), plays the recording through, and digitizes the
+   single visible curve column-by-column exactly like `epoc-record`
+   digitizes each of its 14 simultaneous curves -- reusing the same
+   plot-bounds/OCR/stitching machinery from ``epoc_graph.py``, just with
+   a single-curve-specific ink detector instead of per-channel color
+   disambiguation (irrelevant here since only one curve is ever on
+   screen during a reread pass).
+4. Writes each pass to its own incrementally-flushed CSV, and appends a
+   short cross-correlation-based "common timespan" report comparing the
+   freshly re-read series against the original log's (imprecise) same-
+   channel column.
+
+Y-axis precision: --realtime-budget
+------------------------------------
+Rather than picking an abstract "number of zoom levels," you say how many
+multiples of the recording's OWN duration you're willing to spend
+re-reading each electrode (``--realtime-budget K``, default 2). That
+budget is spent in priority order, 1x each, stopping when it runs out:
+
+1. **fine**: a tight range covering the log's own 1st-99th percentile of
+   observed (non-blank) values for that channel, padded ~10% -- the
+   highest-resolution read of the "normal" signal, and the most valuable
+   single read if the budget only stretches to one.
+2. **wide**: EmotivPRO's "Autoscale" button turned out (confirmed live)
+   to just reset the Amplitude fields back to the fixed +/-100uV default,
+   NOT a true data-driven autofit -- so it is USELESS for finding true
+   extremes and is not used here. Instead the wide pass uses a generous
+   multiple of the log's own observed |value| max for that channel
+   (which is only a LOWER bound on the truth, since a value that went
+   off-screen during the original `epoc-record` capture -- clipped by
+   its fixed +/-100uV default -- would show up as a blank/missing sample,
+   not a wrong one). If the re-read data still touches this pass's own
+   boundary, a warning is written to the match-report recommending a
+   larger --wide-factor and a re-run.
+3. Any further budget (K > 2) buys extra levels geometrically
+   interpolated between the fine and wide ranges.
+
+``--with-high-pass`` re-reads every level --realtime-budget selected a
+second time with EmotivPRO's High-pass filter on -- a separate opt-in
+multiplier (doubles the time spent) rather than part of the budget,
+since it's a different signal (filtered vs raw), not a precision tier.
+
+Motion sensors (--motion-too) have neither an Amplitude control nor a
+High-pass filter checkbox in EmotivPRO's UI (confirmed live) -- they get
+exactly one pass each, autoscaled, whatever range EmotivPRO happens to
+render, unaffected by --realtime-budget/--with-high-pass.
+
+This script is NOT passive: unlike `epoc-record`, it sends real
+mouse/keyboard input to the EmotivPRO window (via `xdotool`). Do not run
+it during a live/currently-recording session -- it operates the
+Recordings list and a recording's replay view, not live capture.
+
+**Must be run attended, in the foreground -- never backgrounded/detached
+(no `&`, `nohup`, etc).** It shares the mouse/keyboard/window with
+whatever else is happening on the desktop, and it has no way to tell the
+difference between "EmotivPRO redrew because of something I clicked" and
+"the user just moved the mouse" except by checking for it: before every
+click and periodically during a pass, it verifies the EmotivPRO window
+is still the same size, still focused, and the pointer is still where it
+last put it. The instant one of those checks fails, it stops clicking,
+prints what it saw, and blocks on stdin for you to confirm the UI is
+idle again before it resumes -- from the start of the current pass, not
+mid-action, since there's no way to know what state a human left things
+in. (Confirmed live why an independent duration matters: an early
+version's end-of-playback detection was icon-based and had two different
+real bugs at different times -- once truncating every pass of a 66-pass
+run to ~10s, later silently dropping the last ~10% of every pass. It's
+scrub-handle-position-based now (see MIN_PLAYING_BEFORE_STOP_S), but give
+it a known --duration whenever you have one regardless; that's a hard
+floor no misdetection of any kind can undercut.)
+
+Runtime is long: each pass takes as long as the recording itself (replay
+is periodically resynced against the scrub handle to correct for actual
+playback speed, confirmed live to NOT be a reliable 1x over a long
+pass). For N electrodes, a
+--realtime-budget of K, an H multiplier (2 if --with-high-pass else 1),
+and a recording of duration D, EEG alone takes roughly N*K*H*D. Use
+--channels/--realtime-budget/--dry-run to scope a test run.
+"""
+
+import argparse
+import csv
+import gzip
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from Xlib import display
+
+from epoc_graph import (
+    CHANNELS,
+    MOTION_CHANNELS,
+    Capture,
+    DIGIT_TEMPLATE_VARIANTS,
+    DIGIT_TEMPLATES_WITH_MINUS,
+    Frame,
+    PlotBounds,
+    _ink_masks,
+    _iso_ns,
+    classify_glyph,
+    find_plot_bounds,
+    read_axis_tick_labels,
+    segment_glyphs,
+    split_wide_runs,
+)
+
+# --- UI geometry, calibrated live against a real 1840x1120 EmotivPRO
+# window (window id 96469000, EmotivPRO 4.11.3.613, "esslli lecture"
+# recording). Single-window-size calibration, same starting point
+# `epoc-record`'s own constants had before being refined across many
+# captures -- see README/plan for how to redo this at other sizes. Where
+# the app's own established pattern (fixed pixel offset from a specific
+# edge, not a fraction of window size) lets a constant be expressed
+# edge-relative, it is, so it should already generalize; where only one
+# raw pixel value was measured, that's noted.
+
+# Left icon bar: fixed pixel position from the top-left corner,
+# confirmed unchanged across a live resize (1840x1120 -> 1300x900).
+ICON_BAR_X_PX = 30
+ICON_Y_EEG_PX = 71
+ICON_Y_MOTION_PX = 222
+
+# Eye ("Show/hide channel(s)") button. EEG tab: single-calibration-point
+# offsets from the top-right corner (measured at window 1840x1120, where
+# an extra "clock" icon appears to its left that isn't present in the
+# Motion tab -- the two tabs' icon clusters are NOT the same width, so
+# these are two independent constants, not one shared value).
+EEG_EYE_FROM_RIGHT_PX = 90
+EEG_EYE_Y_PX = 79
+MOTION_EYE_FROM_RIGHT_PX = 38
+MOTION_EYE_Y_PX = 100
+
+# "Toggle all" button in the show/hide dropdown, and its checkbox grid --
+# 3 columns, N rows, top-left anchored just below the eye button.
+# Offsets from the top-right corner (x) / top edge (y), same single-
+# calibration-point caveat as above.
+EEG_TOGGLE_ALL_FROM_RIGHT_PX = 157
+EEG_TOGGLE_ALL_Y_PX = 93
+EEG_CHECKBOX_COL_FROM_RIGHT_PX = [444, 351, 256, 161]
+EEG_CHECKBOX_ROW_Y_PX = [153, 203, 253, 303]
+
+MOTION_TOGGLE_ALL_FROM_RIGHT_PX = 109
+MOTION_TOGGLE_ALL_Y_PX = 116
+MOTION_CHECKBOX_COL_FROM_RIGHT_PX = [382, 253, 126]
+MOTION_CHECKBOX_ROW_Y_PX = [175, 225, 275, 325]
+
+# A click here closes the show/hide dropdown. Confirmed live TWICE now:
+# (a) the header title (900,24) does NOT close it -- an unverified
+# earlier guess that shipped anyway and cost a real run several
+# obscured passes; (b) clicking the eye button a second time doesn't
+# either, since the open panel visually covers/intercepts that exact
+# spot (the icon row isn't drawn while its own dropdown is open) --
+# only clicking the plot CANVAS itself was ever actually confirmed (in
+# the original live exploration session) to dismiss it. That does
+# trigger a transient hover crosshair/tooltip, confirmed harmless
+# (doesn't seek playback, doesn't change the amplitude fields) and
+# purely cosmetic. Center-of-canvas-ish, well clear of the panel's own
+# top-right bounds.
+INERT_CLICK_X_PX, INERT_CLICK_Y_PX = 900, 500
+
+# EEG single/few-channel left control panel: Channel spacing, Amplitude
+# min/max, High-pass filter checkbox, Autoscale button. Fixed pixel
+# position from the top-left corner (this panel never moves regardless
+# of window size -- confirmed unchanged across the same live resize
+# test), same as `epoc_graph.SPACING_BOX_*_PX`.
+AMPLITUDE_MIN_FIELD_PX = (150, 195)
+AMPLITUDE_MAX_FIELD_PX = (150, 275)
+HIGH_PASS_CHECKBOX_PX = (84, 318)
+
+AUTOSCALE_BUTTON_PX = (173, 360)  # unused for capture (see module docstring) but click-verified live
+
+# Transport bar: fixed offset from the bottom-left corner (confirmed
+# unchanged across the same resize test). Scrub track is linear in
+# elapsed seconds; TRACK_X0_PX is where a click reads ~0s (clicking at
+# or left of this clamps there), TRACK_X1_FROM_RIGHT_PX is where a click
+# reads the recording's full duration -- both calibrated live by
+# clicking known points and reading back the resulting elapsed-time
+# counter via OCR.
+PLAY_BUTTON_PX = (40, None)  # y is TRANSPORT_Y_FROM_BOTTOM_PX
+TRANSPORT_Y_FROM_BOTTOM_PX = 40
+TRACK_X0_PX = 78
+TRACK_X1_FROM_RIGHT_PX = 28
+
+# Recordings list table, fixed pixel position from the top-left corner
+# (measured live at window 1840x1120; see epoc-reread's calibration
+# session). Name cell click point, and Date Collected / Duration cell
+# column bounds (padded a few px beyond the measured ink extent).
+RECORDINGS_NAME_CLICK_X_PX = 150
+RECORDINGS_ROW0_Y_PX = 179
+RECORDINGS_ROW_STEP_PX = 54
+RECORDINGS_DATE_COL_PX = (378, 532)
+RECORDINGS_DURATION_COL_PX = (538, 608)
+RECORDINGS_MAX_ROWS = 40
+RECORDINGS_HEADER_TEXT_Y_PX = 76  # "Recordings" header, used to detect we're on this screen
+
+BACK_ARROW_PX = (24, 24)
+
+# Motion tab's plot canvas starts much closer to the left edge than the
+# EEG tab's (epoc_graph.PLOT_X0_PX=311): there is no left control panel
+# in this tab at all (confirmed live -- no Channel spacing/Amplitude
+# panel ever appears here, single sensor or not), so the canvas's left
+# edge sits right where axis tick labels + a per-row name (e.g. "Q0")
+# are drawn instead. Top/bottom/right margins are assumed unchanged
+# (same fixed chrome height/right-legend-column width) but this hasn't
+# been independently re-verified the way the x0 shift was -- see the
+# module docstring's honesty note about motion calibration.
+MOTION_PLOT_X0_PX = 132
+
+MIN_WINDOW_W, MIN_WINDOW_H = 400, 400
+
+DEFAULT_POLL_INTERVAL = 2.0
+DEFAULT_REALTIME_BUDGET = 2.0
+# End-of-playback floor: never trust the scrub handle reaching the end
+# of the track (see the capture loop) before at least this many seconds
+# have elapsed, so a stray misread right at pass start can't end it
+# early.
+MIN_PLAYING_BEFORE_STOP_S = 8.0
+# Periodic resync against the scrub handle's actual position (see
+# EmotivProUI.read_scrub_fraction) -- confirmed live playback is NOT a
+# reliable 1x realtime over a long pass (~10-13% fast over 4643s), so
+# left uncorrected this compounds into hundreds of seconds of drift by
+# the end of a long recording. Bounds drift to roughly this interval's
+# own worth of speed error instead.
+RESYNC_INTERVAL_S = 45.0
+DEFAULT_WIDE_FACTOR = 3.0
+DEFAULT_WIDE_FLOOR_UV = 150.0
+DEFAULT_FINE_PAD_FRACTION = 0.10
+DEFAULT_FINE_PERCENTILE = (1.0, 99.0)
+DEFAULT_MATCH_TOLERANCE_S = 120.0
+
+
+# --- xdotool wrapper -------------------------------------------------------
+
+
+class Xdo:
+    """Thin wrapper around the `xdotool` CLI, scoped to one window id.
+    All coordinates are window-local (xdotool translates against the
+    given --window itself, independent of window-manager decorations)."""
+
+    def __init__(self, window_id: int, verbose: bool = False):
+        self.window_id = window_id
+        self.verbose = verbose
+        self._last_commanded_pos: Optional[Tuple[int, int]] = None
+
+    def _run(self, args: List[str]) -> None:
+        cmd = ["xdotool"] + args
+        if self.verbose:
+            sys.stderr.write(f"[xdo] {' '.join(cmd)}\n")
+        subprocess.run(cmd, check=True)
+
+    def _pointer_screen_pos(self) -> Optional[Tuple[int, int]]:
+        try:
+            out = subprocess.run(
+                ["xdotool", "getmouselocation", "--shell"], check=True, capture_output=True, text=True
+            ).stdout
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        vals = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        try:
+            return int(vals["X"]), int(vals["Y"])
+        except (KeyError, ValueError):
+            return None
+
+    def pointer_disturbed(self) -> bool:
+        """True if the mouse pointer is no longer where epoc-reread's
+        own last `move()` put it -- the concrete, checkable signal that
+        a human is using the mouse right now (see the module docstring
+        on why this script must run attended, in the foreground)."""
+        if self._last_commanded_pos is None:
+            return False
+        current = self._pointer_screen_pos()
+        if current is None:
+            return False
+        dx = abs(current[0] - self._last_commanded_pos[0])
+        dy = abs(current[1] - self._last_commanded_pos[1])
+        return dx > 3 or dy > 3
+
+    def move(self, x: int, y: int) -> None:
+        self._run(["mousemove", "--window", str(self.window_id), str(x), str(y)])
+        self._last_commanded_pos = self._pointer_screen_pos()
+
+    def click(self, x: int, y: int, button: int = 1, settle: float = 0.2) -> None:
+        self.move(x, y)
+        time.sleep(0.05)
+        self._run(["click", "--window", str(self.window_id), str(button)])
+        time.sleep(settle)
+
+    def key(self, combo: str, settle: float = 0.05) -> None:
+        self._run(["key", "--window", str(self.window_id), combo])
+        time.sleep(settle)
+
+    def type_text(self, text: str, settle: float = 0.05) -> None:
+        # "--" stops xdotool from parsing a leading "-" (negative
+        # numbers) as an option flag.
+        self._run(["type", "--window", str(self.window_id), "--", text])
+        time.sleep(settle)
+
+    def activate(self) -> None:
+        self._run(["windowactivate", str(self.window_id)])
+
+
+# --- Log reading -------------------------------------------------------
+
+
+@dataclass
+class LogChannelStats:
+    observed_abs_max: float
+    fine_lo: float
+    fine_hi: float
+    n_values: int
+
+
+@dataclass
+class LogData:
+    start_ts_ns: int
+    end_ts_ns: int
+    # channel -> list of (ts_ns, value) for non-blank samples only
+    series: Dict[str, List[Tuple[int, float]]]
+    channels: List[str]
+
+
+def _open_maybe_gz(path: str):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", newline="")
+    return open(path, "rt", newline="")
+
+
+def read_log(path: str, channels: List[str]) -> LogData:
+    with _open_maybe_gz(path) as f:
+        reader = csv.DictReader(f)
+        first_ts: Optional[int] = None
+        last_ts: Optional[int] = None
+        series: Dict[str, List[Tuple[int, float]]] = {ch: [] for ch in channels}
+        for row in reader:
+            ts_ns = int(row["timestamp_ns"])
+            if first_ts is None:
+                first_ts = ts_ns
+            last_ts = ts_ns
+            for ch in channels:
+                raw = row.get(ch, "")
+                if raw:
+                    try:
+                        series[ch].append((ts_ns, float(raw)))
+                    except ValueError:
+                        pass
+    if first_ts is None or last_ts is None:
+        raise ValueError(f"{path}: no data rows")
+    return LogData(start_ts_ns=first_ts, end_ts_ns=last_ts, series=series, channels=channels)
+
+
+def compute_channel_stats(values: List[float]) -> Optional[LogChannelStats]:
+    if not values:
+        return None
+    arr = np.array(values, dtype=np.float64)
+    lo, hi = np.percentile(arr, DEFAULT_FINE_PERCENTILE)
+    span = max(1.0, hi - lo)
+    pad = span * DEFAULT_FINE_PAD_FRACTION
+    return LogChannelStats(
+        observed_abs_max=float(np.abs(arr).max()),
+        fine_lo=float(lo - pad),
+        fine_hi=float(hi + pad),
+        n_values=len(values),
+    )
+
+
+def _nice_round(v: float) -> float:
+    """Round a µV bound outward to a visually clean number (nearest 5),
+    so the value typed into EmotivPRO's field is easy for a human to
+    sanity-check against the chart -- not required for correctness."""
+    return float(np.ceil(abs(v) / 5.0) * 5.0) * (1 if v >= 0 else -1)
+
+
+def plan_zoom_levels(
+    stats: LogChannelStats, realtime_budget: float, wide_factor: float, wide_floor: float
+) -> List[Tuple[float, float, str]]:
+    """Returns [(amp_min, amp_max, tag), ...] in PRIORITY order (do
+    these first if the budget runs out), not widest-first: `fine` comes
+    first (best resolution of the normal signal -- confirmed with the
+    user to matter more than recovering rare clipped extremes when
+    budget is tight), then `wide`, then any extra interpolated levels
+    budget affords beyond those two. See module docstring for the
+    fine/wide rationale and --realtime-budget's semantics (this does NOT
+    include high-pass variants -- see --with-high-pass, a separate
+    multiplier applied by the caller, not this planner)."""
+    fine_mag = max(abs(stats.fine_lo), abs(stats.fine_hi))
+    wide_mag = max(wide_floor, stats.observed_abs_max * wide_factor, fine_mag * 1.5)
+    wide_mag = _nice_round(wide_mag)
+    fine_mag = _nice_round(max(1.0, fine_mag))
+
+    n_levels = max(1, int(realtime_budget))  # each level costs exactly 1x the recording's duration
+
+    levels: List[Tuple[float, float, str]] = [(-fine_mag, fine_mag, "fine")]
+    if n_levels == 1:
+        return levels
+    levels.append((-wide_mag, wide_mag, "wide"))
+    if n_levels == 2:
+        return levels
+
+    # Extra budget beyond fine+wide: geometrically interpolated
+    # intermediate levels, ordered fine-ward-first (closest to the
+    # already-included fine level first, since that's the region most
+    # likely to still be under-resolved -- the wide end is already
+    # covered by the wide level above).
+    n_extra = n_levels - 2
+    ratios = np.geomspace(fine_mag, wide_mag, n_extra + 2)[1:-1]
+    for i, mag in enumerate(ratios, start=1):
+        mag = _nice_round(float(mag))
+        levels.append((-mag, mag, f"z{i}"))
+    return levels
+
+
+def tag_for_range(amp_min: float, amp_max: float) -> str:
+    def fmt(v: float) -> str:
+        return str(int(v)) if float(v).is_integer() else str(v)
+
+    return f"{fmt(amp_min)}_{fmt(amp_max)}"
+
+
+# --- Recordings list matching -------------------------------------------
+
+
+DEFAULT_MAX_DURATION_S = 4 * 3600.0  # safety cap when duration isn't known (see --recording-index)
+
+
+@dataclass
+class RecordingRow:
+    row_index: int
+    name_y: int
+    start_ts_ns: Optional[int] = None
+    duration_s: Optional[float] = None
+
+    @property
+    def end_ts_ns(self) -> Optional[int]:
+        if self.start_ts_ns is None or self.duration_s is None:
+            return None
+        return self.start_ts_ns + int(self.duration_s * 1e9)
+
+
+def _ocr_digit_cell(rgb: np.ndarray, templates=None, variants=None) -> Optional[str]:
+    """OCR a cell that mixes digits with punctuation (/, :, space) by
+    classifying every segmented glyph and keeping only the ones that
+    confidently match a digit -- punctuation glyphs reliably fail to
+    match any digit template and are dropped, rather than needing to be
+    explicitly recognized (see epoc-reread's module docstring). Pass
+    templates=DIGIT_TEMPLATES_WITH_MINUS to also recognize a leading
+    minus sign (needed for reading back the Amplitude min field, which
+    is negative more often than not -- default digit-only templates
+    would silently drop the sign, misreading e.g. "-80" as "80")."""
+    if rgb.size == 0:
+        return None
+    seg_mask, shape_mask = _ink_masks(rgb)
+    rows_with_ink = np.where(seg_mask.any(axis=1))[0]
+    if rows_with_ink.size == 0:
+        return None
+    y0, y1 = rows_with_ink.min(), rows_with_ink.max() + 1
+    seg_mask = seg_mask[y0:y1]
+    shape_mask = shape_mask[y0:y1]
+    # split_wide_runs recovers touching/kerned-with-zero-gap digits (e.g.
+    # "40") that segment_glyphs alone hands back as one merged run --
+    # confirmed live this was missing here (unlike epoc_graph's own
+    # read_digits_in_box, which already does this): a real "-40" reading
+    # at a smaller window size merged into one 16px run, misclassified
+    # as unrecognizable, silently dropping BOTH digits (only the minus
+    # sign survived) instead of misreading -- still fails closed, but
+    # only by accident, and uselessly so given the digits were right
+    # there on screen.
+    glyph_ranges = split_wide_runs(segment_glyphs(seg_mask))
+    digits = []
+    kwargs = {}
+    if templates:
+        kwargs["templates"] = templates
+    if variants:
+        kwargs["variants"] = variants
+    for x0, x1 in glyph_ranges:
+        c = classify_glyph(shape_mask, x0, x1, **kwargs)
+        if c != "?":
+            digits.append(c)
+    return "".join(digits) if digits else None
+
+
+def _parse_date_collected(digits: str) -> Optional[int]:
+    """DD/MM/YYYY HH:MM:SS -> UTC-naive local wall-clock ns timestamp
+    (compared against the log's own local-derived timestamps -- both
+    sides are "local wall clock, no explicit tz", consistent with how
+    epoc-record's own filenames/timestamps are used elsewhere in this
+    repo)."""
+    if len(digits) != 14:
+        return None
+    import datetime as _dt
+
+    try:
+        dd, mm, yyyy = int(digits[0:2]), int(digits[2:4]), int(digits[4:8])
+        HH, MM, SS = int(digits[8:10]), int(digits[10:12]), int(digits[12:14])
+        dt = _dt.datetime(yyyy, mm, dd, HH, MM, SS)
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1e9)
+
+
+def parse_recording_start_arg(spec: str) -> int:
+    """Parses --recording-start's "DD/MM/YYYY HH:MM:SS" CLI value by
+    reusing _parse_date_collected's exact same digit-string parsing
+    (strip everything but digits, same DDMMYYYYHHMMSS layout) so both
+    paths -- OCR'd from the table, or typed on the command line -- agree
+    on format and timezone handling."""
+    digits = "".join(c for c in spec if c.isdigit())
+    ts = _parse_date_collected(digits)
+    if ts is None:
+        raise argparse.ArgumentTypeError(f'--recording-start: could not parse {spec!r} as "DD/MM/YYYY HH:MM:SS"')
+    return ts
+
+
+def _parse_duration(digits: str) -> Optional[float]:
+    if len(digits) != 6:
+        return None
+    try:
+        HH, MM, SS = int(digits[0:2]), int(digits[2:4]), int(digits[4:6])
+    except ValueError:
+        return None
+    return HH * 3600 + MM * 60 + SS
+
+
+def read_recordings_table(cap: Capture, verbose: bool = False) -> List[RecordingRow]:
+    rows: List[RecordingRow] = []
+    blank_streak = 0
+    for i in range(RECORDINGS_MAX_ROWS):
+        y_center = RECORDINGS_ROW0_Y_PX + i * RECORDINGS_ROW_STEP_PX
+        frame = cap.capture_frame(verbose=verbose)
+        if frame is None:
+            break
+        y0, y1 = y_center - 10, y_center + 10
+        dx0, dx1 = RECORDINGS_DATE_COL_PX
+        ux0, ux1 = RECORDINGS_DURATION_COL_PX
+        date_digits = _ocr_digit_cell(frame.rgb[y0:y1, dx0:dx1])
+        dur_digits = _ocr_digit_cell(frame.rgb[y0:y1, ux0:ux1])
+        start_ts = _parse_date_collected(date_digits) if date_digits else None
+        duration_s = _parse_duration(dur_digits) if dur_digits else None
+        if start_ts is None or duration_s is None:
+            blank_streak += 1
+            if blank_streak >= 2:
+                break
+            continue
+        blank_streak = 0
+        rows.append(RecordingRow(row_index=i, name_y=y_center, start_ts_ns=start_ts, duration_s=duration_s))
+    return rows
+
+
+def match_recording(
+    log: LogData, rows: List[RecordingRow], tolerance_s: float, verbose: bool = False
+) -> Optional[RecordingRow]:
+    tol_ns = int(tolerance_s * 1e9)
+    best: Optional[Tuple[int, RecordingRow]] = None
+    for row in rows:
+        overlap_start = max(log.start_ts_ns - tol_ns, row.start_ts_ns - tol_ns)
+        overlap_end = min(log.end_ts_ns + tol_ns, row.end_ts_ns + tol_ns)
+        overlap = overlap_end - overlap_start
+        if verbose:
+            sys.stderr.write(
+                f"[match] row {row.row_index}: rec=[{row.start_ts_ns},{row.end_ts_ns}] "
+                f"log=[{log.start_ts_ns},{log.end_ts_ns}] overlap_ns={overlap}\n"
+            )
+        if overlap > 0 and (best is None or overlap > best[0]):
+            best = (overlap, row)
+    return best[1] if best else None
+
+
+class Disruption(Exception):
+    """Raised when epoc-reread detects EmotivPRO's UI changed outside
+    its own control -- resized, lost focus, or the mouse pointer moved
+    on its own -- which almost always means a human is actively using
+    the computer right now. Caught by run_pass_with_recovery, which
+    stops clicking immediately, explains what it saw, and waits for the
+    user to confirm before restarting the whole pass from scratch (never
+    tries to resume mid-pass -- there's no way to know what state a
+    human left the UI in)."""
+
+
+# --- Navigation primitives ------------------------------------------------
+
+
+class EmotivProUI:
+    def __init__(self, cap: Capture, xdo: Xdo, verbose: bool = False):
+        self.cap = cap
+        self.xdo = xdo
+        self.verbose = verbose
+        self._last_geo: Optional[Tuple[int, int]] = None
+
+    def frame(self) -> Frame:
+        f = self.cap.capture_frame(verbose=self.verbose)
+        if f is None:
+            raise RuntimeError("EmotivPRO window not found/readable")
+        return f
+
+    def _active_window_id(self) -> Optional[int]:
+        try:
+            out = subprocess.run(
+                ["xdotool", "getactivewindow"], capture_output=True, text=True
+            ).stdout.strip()
+            return int(out)
+        except (subprocess.CalledProcessError, ValueError):
+            return None
+
+    def is_content_visible(self, frame: Optional[Frame] = None) -> bool:
+        """Whether EmotivPRO's own content is genuinely on top and
+        unobscured.
+
+        Two checks, both direct pixel evidence rather than inferred from
+        window-manager focus (confirmed with the user this matters: a
+        window can be fully covered by another app without ever losing
+        X11 "active window" status depending on the window manager, and
+        conversely focus can flap for reasons unrelated to occlusion):
+
+        1. A fixed patch that's always a flat, distinctive light gray
+           (225,225,225) in the chart view's left icon-bar column -- the
+           same corner on_recordings_list already relies on for the
+           opposite discrimination.
+        2. The plot canvas itself isn't densely covered in "ink".
+           Confirmed live this is NOT redundant with (1): this script's
+           own terminal window sat on top of EmotivPRO's plot area for a
+           stretch of a real capture (its icon-bar corner happened to
+           stay clear, so check 1 alone passed the whole time) and
+           produced a burst of repeated, wrong values in the output --
+           traced to the digitizer finding "curve ink" in what was
+           actually terminal text. A real EEG curve, however busy, is a
+           thin trace across a mostly-blank canvas (confirmed live:
+           <0.3% of plot pixels count as ink even with a live signal
+           drawn); dense text/UI from an occluding window fills a
+           double-digit percentage instead -- an easy, wide-margin
+           separation. Skipped (not a failure) if the plot canvas can't
+           be located at all, since check_content is only ever enabled
+           while already in a chart view where it should always be
+           findable -- treat that as its own instability instead via
+           the fixed-geometry check below."""
+        f = frame if frame is not None else self.frame()
+        patch = f.rgb[390:410, 10:20].reshape(-1, 3).astype(np.int32)
+        mean = patch.mean(axis=0)
+        if not (mean.max() < 245 and (mean.max() - mean.min()) < 8 and mean.mean() > 200):
+            return False
+        bounds = find_plot_bounds(f)
+        if bounds is not None and bounds.width > 0 and bounds.height > 0:
+            plot_rgb = f.rgb[bounds.y0 : bounds.y1, bounds.x0 : bounds.x1]
+            if find_lone_curve_pixels(plot_rgb).mean() > 0.08:
+                return False
+        return True
+
+    def snapshot_stable_state(self) -> None:
+        """(Re-)establishes the "known good" baseline (window size,
+        pointer position) that is_stable() compares against -- call
+        this whenever epoc-reread has just taken deliberate control
+        (start of a pass, or right after a user confirms it's safe to
+        resume) so its OWN upcoming actions aren't mistaken for a
+        disruption."""
+        try:
+            geo = self.cap.window.get_geometry()
+            self._last_geo = (geo.width, geo.height)
+        except Exception:
+            self._last_geo = None
+
+    def is_stable(
+        self, check_pointer: bool = True, check_focus: bool = True, check_content: bool = False
+    ) -> Tuple[bool, str]:
+        """The concrete, checkable version of "is the user doing
+        something right now": the EmotivPRO window still exists at the
+        same size epoc-reread last saw (always checked -- a resize
+        invalidates every fixed-pixel coordinate this script uses, the
+        one thing that's unsafe to ignore even mid-capture), plus,
+        depending on the flags, whether it's still the focused/active
+        window, whether its content is genuinely visible/unobscured
+        (see is_content_visible), and whether the mouse pointer has
+        moved since epoc-reread's own last commanded move.
+
+        ``check_pointer=False`` is for the periodic check during pure
+        screen-capture (no clicking happening at all): confirmed live it
+        produced repeated false positives there with nothing concrete to
+        protect (there's no click to misdirect if nothing is being
+        clicked).
+
+        ``check_content`` (default off) is for that SAME periodic
+        check -- it's the direct "is the window actually visible" test,
+        preferred over ``check_focus`` there (confirmed with the user:
+        clear content visibility matters more than X11 focus, and also
+        confirmed live that focus alone flapped to an unrelated window
+        with no evidence of real occlusion). It assumes the chart view's
+        left icon bar is on screen, which is only true once a pass is
+        actually under way -- NOT during navigation/setup (e.g. while
+        still on the Recordings list) -- so it defaults off and is only
+        turned on by the in-pass capture loop, which knows that's where
+        it is.
+
+        ``check_focus`` (default on) covers setup/navigation instead,
+        where content-visibility's chart-view assumption doesn't hold
+        yet."""
+        geo = None
+        for attempt in range(2):
+            try:
+                geo = self.cap.window.get_geometry()
+                break
+            except Exception:
+                if attempt == 0:
+                    # Confirmed live: get_geometry() can throw once as a
+                    # transient X11 blip (the window was fine a moment
+                    # before and a moment after) -- one immediate retry
+                    # before concluding it's actually gone.
+                    time.sleep(0.2)
+        if geo is None:
+            return False, "the EmotivPRO window no longer exists or isn't readable"
+        size = (geo.width, geo.height)
+        if self._last_geo is not None and size != self._last_geo:
+            return False, f"the EmotivPRO window was resized ({self._last_geo} -> {size})"
+        if check_content and not self.is_content_visible():
+            return False, "EmotivPRO's content is no longer clearly visible (something else is drawn over it)"
+        if check_focus:
+            active = self._active_window_id()
+            if active is not None and active != self.xdo.window_id:
+                return False, "EmotivPRO is no longer the focused/active window"
+        if check_pointer and self.xdo.pointer_disturbed():
+            return False, "the mouse pointer moved on its own since epoc-reread's last click"
+        return True, ""
+
+    def require_stable(
+        self, check_pointer: bool = True, check_focus: bool = True, check_content: bool = False
+    ) -> None:
+        ok, reason = self.is_stable(check_pointer=check_pointer, check_focus=check_focus, check_content=check_content)
+        if not ok:
+            raise Disruption(reason)
+
+    def pause_for_confirmation(self, reason: str) -> None:
+        """Stops and waits on stdin -- this is why epoc-reread must run
+        attended in the foreground, never backgrounded/detached: there
+        is no other channel for a human to answer this."""
+        print(f"\n*** epoc-reread paused: {reason} ***")
+        print(
+            "EmotivPRO's UI looks like it changed outside epoc-reread's own control -- "
+            "most likely you're using it right now. Let it settle back to a normal state "
+            "(the Recordings list or a chart view, not mid-drag/resize/dialog), then press "
+            "Enter here to let epoc-reread take over the UI again (or Ctrl-C to stop for good)."
+        )
+        input()
+        self.xdo.activate()
+        time.sleep(0.5)
+        self.snapshot_stable_state()
+
+    def on_recordings_list(self) -> bool:
+        # The chart view's left icon bar renders as a light gray column
+        # (measured (225,225,225)) starting at the very left edge; the
+        # Recordings list has no such column -- pure white there
+        # (measured (255,255,255) / (249,249,249)). Cheap and reliable:
+        # sample a small patch well inside where that column would be
+        # and check it's NOT gray.
+        f = self.frame()
+        patch = f.rgb[390:410, 10:20].reshape(-1, 3).astype(np.int32)
+        mean = patch.mean(axis=0)
+        is_gray_icon_bar = mean.max() < 245 and (mean.max() - mean.min()) < 5
+        return not is_gray_icon_bar
+
+    def go_to_recordings_list(self) -> None:
+        for _ in range(3):
+            if self.on_recordings_list():
+                return
+            self.xdo.click(*BACK_ARROW_PX)
+        if not self.on_recordings_list():
+            raise RuntimeError("could not navigate back to the Recordings list")
+
+    def open_recording(self, row: RecordingRow) -> None:
+        self.go_to_recordings_list()
+        self.xdo.click(RECORDINGS_NAME_CLICK_X_PX, row.name_y)
+        time.sleep(1.5)  # loading the chart view
+
+    def click_icon(self, tab: str) -> None:
+        y = ICON_Y_EEG_PX if tab == "eeg" else ICON_Y_MOTION_PX
+        self.xdo.click(ICON_BAR_X_PX, y)
+
+    def _eye_pos(self, tab: str) -> Tuple[int, int]:
+        w = self.frame().width
+        if tab == "eeg":
+            return w - EEG_EYE_FROM_RIGHT_PX, EEG_EYE_Y_PX
+        return w - MOTION_EYE_FROM_RIGHT_PX, MOTION_EYE_Y_PX
+
+    def _toggle_all_pos(self, tab: str) -> Tuple[int, int]:
+        w = self.frame().width
+        if tab == "eeg":
+            return w - EEG_TOGGLE_ALL_FROM_RIGHT_PX, EEG_TOGGLE_ALL_Y_PX
+        return w - MOTION_TOGGLE_ALL_FROM_RIGHT_PX, MOTION_TOGGLE_ALL_Y_PX
+
+    def _checkbox_positions(self, tab: str, channels: List[str]) -> Dict[str, Tuple[int, int]]:
+        w = self.frame().width
+        cols = EEG_CHECKBOX_COL_FROM_RIGHT_PX if tab == "eeg" else MOTION_CHECKBOX_COL_FROM_RIGHT_PX
+        row_ys = EEG_CHECKBOX_ROW_Y_PX if tab == "eeg" else MOTION_CHECKBOX_ROW_Y_PX
+        ncols = len(cols)
+        pos = {}
+        for i, ch in enumerate(channels):
+            r, c = divmod(i, ncols)
+            pos[ch] = (w - cols[c], row_ys[r])
+        return pos
+
+    def _checkbox_checked(self, frame: Frame, x: int, y: int) -> bool:
+        patch = frame.rgb[y - 3 : y + 3, x - 3 : x + 3].reshape(-1, 3).astype(np.int32)
+        dist_from_white = (255 - patch).sum(axis=1).mean()
+        return dist_from_white > 60
+
+    def is_panel_open(self, tab: str) -> bool:
+        """Whether the "Show/hide channel(s)" dropdown is currently
+        open, by sampling the Toggle-all button's position: it's a
+        solid dark-filled button when the panel is open, and empty plot
+        canvas (near-white, occasionally crossed by a curve line) when
+        closed -- averaged over a small patch to keep a stray curve
+        pixel from reading as "still open"."""
+        f = self.frame()
+        tx, ty = self._toggle_all_pos(tab)
+        patch = f.rgb[ty - 4 : ty + 4, tx - 4 : tx + 4].reshape(-1, 3).astype(np.int32)
+        return patch.mean() < 200
+
+    def close_panel_if_open(self, tab: str) -> None:
+        """Confirmed live (a real run left this panel open across an
+        entire capture, silently obscuring part of the curve underneath
+        it -- wasted a full pass): closing it is NOT optional/best-effort,
+        it's verified. A click on the plot canvas is the only method
+        confirmed live to actually dismiss it -- clicking the eye button
+        again does NOT work (the panel visually covers/intercepts that
+        exact spot while it's open, so the click lands on the panel, not
+        the icon underneath); raises if it's somehow still open
+        afterward rather than silently capturing with it in the way."""
+        if not self.is_panel_open(tab):
+            return
+        self.xdo.click(INERT_CLICK_X_PX, INERT_CLICK_Y_PX, settle=0.3)
+        if self.is_panel_open(tab):
+            raise RuntimeError("could not close the channel-selector panel before capturing")
+
+    def select_only(self, tab: str, channel: str, channels: List[str]) -> None:
+        ex, ey = self._eye_pos(tab)
+        self.xdo.click(ex, ey, settle=0.3)
+        positions = self._checkbox_positions(tab, channels)
+        f = self.frame()
+        checked = {ch: self._checkbox_checked(f, *pos) for ch, pos in positions.items()}
+        n_checked = sum(checked.values())
+        if n_checked != 0:
+            tx, ty = self._toggle_all_pos(tab)
+            # "Toggle all" flips every box; if it isn't already all-off,
+            # one click of "select all" then a second of "deselect all"
+            # gets there from any starting state (all-on -> click once;
+            # mixed -> click once lands all-on, click again all-off).
+            self.xdo.click(tx, ty, settle=0.3)
+            f = self.frame()
+            checked = {ch: self._checkbox_checked(f, *pos) for ch, pos in positions.items()}
+            if sum(checked.values()) != 0:
+                self.xdo.click(tx, ty, settle=0.3)
+                f = self.frame()
+                checked = {ch: self._checkbox_checked(f, *pos) for ch, pos in positions.items()}
+            if sum(checked.values()) != 0:
+                raise RuntimeError("could not drive the channel selector to all-off")
+        cx, cy = positions[channel]
+        self.xdo.click(cx, cy, settle=0.3)
+        f = self.frame()
+        if not self._checkbox_checked(f, cx, cy):
+            raise RuntimeError(f"clicking {channel}'s checkbox did not check it")
+        self.close_panel_if_open(tab)
+
+    def _set_field(self, pos: Tuple[int, int], value: float) -> None:
+        """Blind type, no OCR read-back. Confirmed live (repeatedly) that
+        reading these fields back with the digit-template matcher is
+        unreliable at their small render size -- a real, VISUALLY
+        CONFIRMED CORRECT "-4235" was confidently misread as "-5255" one
+        run and "-122" the next, different wrong answers for the same
+        genuinely-correct value. That made the read-back a net negative:
+        it failed on correct input more often than it ever caught real
+        corruption. The one real corruption mechanism found live
+        (toggling High-pass filter resets/changes the Amplitude fields)
+        is fixed at its actual root cause instead -- high-pass is always
+        set BEFORE amplitude, see set_amplitude's call site -- so a
+        single confident type is enough. Verify this by eye during
+        development (watch the field after a run of set_amplitude calls)
+        rather than re-deriving an OCR gate here."""
+        x, y = pos
+        text = str(int(value)) if float(value).is_integer() else str(value)
+        self.xdo.click(x, y, settle=0.15)
+        self.xdo.key("ctrl+a")
+        self.xdo.type_text(text)
+        self.xdo.key("Tab", settle=0.3)
+
+    def set_amplitude(self, amp_min: float, amp_max: float) -> None:
+        self._set_field(AMPLITUDE_MIN_FIELD_PX, amp_min)
+        self._set_field(AMPLITUDE_MAX_FIELD_PX, amp_max)
+
+    def _high_pass_checked(self, frame: Frame) -> bool:
+        x, y = HIGH_PASS_CHECKBOX_PX
+        return self._checkbox_checked(frame, x, y)
+
+    def set_high_pass(self, enabled: bool) -> None:
+        f = self.frame()
+        if self._high_pass_checked(f) != enabled:
+            self.xdo.click(*HIGH_PASS_CHECKBOX_PX, settle=0.2)
+
+    def seek_to_start(self) -> None:
+        f = self.frame()
+        y = f.height - TRANSPORT_Y_FROM_BOTTOM_PX
+        self.xdo.click(TRACK_X0_PX, y, settle=0.3)
+
+    def seek_to_fraction(self, frac: float) -> None:
+        """Click the scrub track at the point corresponding to `frac`
+        (0..1) of the total recording -- reuses the same linear
+        track-x0-to-x1 model TRACK_X0_PX/TRACK_X1_FROM_RIGHT_PX were
+        calibrated with for seek_to_start's 0-end. Used to resume a
+        disrupted pass roughly where it left off instead of restarting
+        the whole pass from 0 -- "roughly" because the track's pixel
+        resolution over a long recording is coarser than a second, but
+        that's fine: a few seconds of re-captured overlap is cheap
+        compared to redoing the whole pass, and Stitcher's own
+        timestamp-based dedup handles the overlap cleanly either way."""
+        f = self.frame()
+        frac = max(0.0, min(0.98, frac))
+        x0 = TRACK_X0_PX
+        x1 = f.width - TRACK_X1_FROM_RIGHT_PX
+        x = int(x0 + frac * (x1 - x0))
+        y = f.height - TRANSPORT_Y_FROM_BOTTOM_PX
+        self.xdo.click(x, y, settle=0.3)
+
+    def read_scrub_fraction(self, frame: Frame) -> Optional[float]:
+        """Locates the pink scrub-handle's x position on the transport
+        track and returns its fraction (0..1) of TRACK_X0_PX..(width-
+        TRACK_X1_FROM_RIGHT_PX) -- EmotivPRO's own ground truth for how
+        far into the recording playback actually is right now.
+
+        This exists because playback is NOT reliably ~1x realtime over
+        a long pass: confirmed live on a 4643s recording that a
+        continuous single pass finished in ~4200s of wall-clock time
+        (~10-13% fast), and a lag-search against the original log
+        showed the effective lag growing from about -40s in the pass's
+        first few minutes to about -550s near its end -- a genuine,
+        roughly linear speed error, not just a one-time startup offset.
+        The elapsed/total text counter (read_elapsed_total_seconds)
+        would be the obvious ground truth to periodically resync
+        against instead of assuming 1x, but confirmed live it renders
+        far too small and low-contrast for this project's digit-template
+        matcher (or even that same matcher fed an upscaled crop) to read
+        reliably -- every attempt returned garbage digits against a
+        visually-legible "00:33:36 / 01:17:23". The scrub handle has
+        neither problem: it's a large, saturated, distinctly-colored
+        blob against a plain track, so no digit classification is
+        needed at all, just a color-mask centroid."""
+        f = frame
+        y = f.height - TRANSPORT_Y_FROM_BOTTOM_PX
+        band = f.rgb[y - 15 : y + 15, :]
+        r = band[:, :, 0].astype(int)
+        g = band[:, :, 1].astype(int)
+        b = band[:, :, 2].astype(int)
+        pinkish = (r > 180) & (g < 80) & (b > 60) & (b < 160)
+        xs = np.where(pinkish.any(axis=0))[0]
+        if len(xs) == 0:
+            return None
+        handle_x = (int(xs.min()) + int(xs.max())) / 2.0
+        x0 = TRACK_X0_PX
+        x1 = f.width - TRACK_X1_FROM_RIGHT_PX
+        if x1 <= x0:
+            return None
+        return max(0.0, min(1.0, (handle_x - x0) / (x1 - x0)))
+
+    def _play_pause_pos(self, frame: Frame) -> Tuple[int, int]:
+        x, _ = PLAY_BUTTON_PX
+        return x, frame.height - TRANSPORT_Y_FROM_BOTTOM_PX
+
+    def is_playing(self, frame: Optional[Frame] = None, sample_gap_s: float = 8.0) -> bool:
+        """Whether playback is genuinely advancing right now.
+
+        Used to compare the play/pause icon's ink shape (a triangle vs.
+        two parallel bars) at a single instant. Confirmed live that read
+        is simply unreliable during real continuous playback -- direct,
+        repeated checks read "paused" while the scrub handle was
+        visibly advancing (~9.4s of video over ~10s of wall time,
+        confirmed by comparing two read_scrub_fraction reads). A single
+        frame can't show motion at all, so this now takes two scrub-
+        handle readings `sample_gap_s` apart and checks whether the
+        handle actually moved -- slower (one real sleep) but grounded in
+        something proven to track true playback position, unlike the
+        icon.
+
+        `sample_gap_s` defaults large (8s) because the handle's own
+        pixel resolution is coarse over a long recording (confirmed live
+        ~2.7s/px on a 4643s one) -- too short a gap (0.35s was tried
+        first) can't move the handle by even one pixel, indistinguishable
+        from genuinely paused, and confirmed live to misreport a video
+        that was DEFINITELY still playing as paused. Fine for how this
+        is actually used (setup and disruption recovery, not the hot
+        capture loop, so a few extra seconds of latency doesn't matter).
+
+        `frame`, if given, is used for the FIRST sample only (a second is
+        always captured fresh, since motion needs two points); accepted
+        for compatibility with callers that already have one on hand."""
+        f0 = frame if frame is not None else self.frame()
+        frac0 = self.read_scrub_fraction(f0)
+        if frac0 is None:
+            return False
+        time.sleep(sample_gap_s)
+        frac1 = self.read_scrub_fraction(self.frame())
+        if frac1 is None:
+            return False
+        return frac1 > frac0 + 3e-4  # ~0.5px worth of the track, to clear read noise
+
+    def ensure_paused(self) -> None:
+        f = self.frame()
+        if self.is_playing(f):
+            x, y = self._play_pause_pos(f)
+            self.xdo.click(x, y, settle=0.3)
+
+    def play(self) -> None:
+        f = self.frame()
+        if not self.is_playing(f):
+            x, y = self._play_pause_pos(f)
+            self.xdo.click(x, y, settle=0.3)
+
+
+# --- Single-curve digitization -------------------------------------------
+
+
+def motion_plot_bounds(frame: Frame) -> Optional[PlotBounds]:
+    """Like epoc_graph.find_plot_bounds, but for the Motion tab's
+    different (no-left-panel) canvas left edge -- see MOTION_PLOT_X0_PX."""
+    from epoc_graph import PLOT_X_RIGHT_MARGIN_PX, PLOT_Y0_PX, PLOT_Y_BOTTOM_MARGIN_PX
+
+    x0 = MOTION_PLOT_X0_PX
+    x1 = frame.width - PLOT_X_RIGHT_MARGIN_PX
+    y0 = PLOT_Y0_PX
+    y1 = frame.height - PLOT_Y_BOTTOM_MARGIN_PX
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return PlotBounds(x0, y0, x1, y1)
+
+
+def find_lone_curve_pixels(plot_rgb: np.ndarray) -> np.ndarray:
+    """Boolean (h, w) mask of "curve ink" pixels for a plot with exactly
+    one visible curve -- unlike epoc_graph.classify_plot_pixels (which
+    disambiguates many simultaneous same-canvas curves by color), a
+    reread pass never has more than one curve on screen at a time, so no
+    per-channel color calibration is needed or attempted here: anything
+    clearly darker/more saturated than the near-white canvas and the
+    light-gray gridlines counts.
+
+    Gridlines render as a flat, very light, near-neutral gray (empirically
+    just a few levels below pure white); the curve itself -- whatever
+    color EmotivPRO assigned this channel -- is both darker and/or more
+    saturated than that by a wide margin at every window size tested."""
+    r = plot_rgb[..., 0].astype(np.int32)
+    g = plot_rgb[..., 1].astype(np.int32)
+    b = plot_rgb[..., 2].astype(np.int32)
+    dist_from_white = (255 - r) + (255 - g) + (255 - b)
+    # Gridlines measured ~15-20 Manhattan-distance-from-white; a real
+    # curve stroke (even anti-aliased, even a light color) reaches well
+    # past that except at its very edge pixels, which is fine to miss
+    # (digitize_curve just needs the row's ink centroid, not every pixel).
+    match = dist_from_white > 45
+    h, w = match.shape
+    # Suppress a narrow band right at the bottom of the canvas: confirmed
+    # live a near-solid row lives there (~97% of columns "ink," one
+    # fixed pixel value across the whole run) -- the plot's own X-axis
+    # baseline, NOT the curve. With digitize_curve's lone-curve search
+    # spanning the full canvas height (no neighboring channel to avoid,
+    # so nothing else restricts it -- see digitize_lone_curve_capture),
+    # any column where the real curve is genuinely absent had nothing to
+    # stop this line winning by default, confirmed live to fabricate a
+    # long, exactly-repeated, boundary-adjacent value with no basis in
+    # the original log's own data for that same span.
+    #
+    # Deliberately narrow and POSITION-based (not a row-wide ink-density
+    # threshold, which was tried first and reverted): this data is from
+    # a real "low-quality" recording where a badly-contacted electrode
+    # genuinely rails against its clipping boundary for extended
+    # stretches -- confirmed live that a density threshold generous
+    # enough to spare that real, flat, clipped curve was already above
+    # where the axis line needed to sit to be excluded, and a threshold
+    # tight enough to catch the axis line instead blanked out ~99% of a
+    # whole pass's genuinely-clipped-but-real data. Position doesn't have
+    # that conflict: the axis line sits at one fixed row regardless of
+    # channel or amplitude range, comfortably inboard of where a curve
+    # actually clipped at amp_min would render (the true bottom edge),
+    # so excluding only a narrow band around the line's own row leaves
+    # genuine edge-clipped data alone.
+    axis_row = int(0.988 * h)
+    match[max(0, axis_row - 6) : axis_row + 6, :] = False
+    # Suppress the top-right corner where EmotivPRO floats its own
+    # chrome (clock-format toggle, "HRS", hide-channels eye icon) ON TOP
+    # of the plot canvas, inside `bounds` -- confirmed live via a live
+    # capture: rows 2-35 within the rightmost ~10% of the canvas read
+    # 25-49% ink there from that chrome alone, dropping to exactly 0
+    # right at row 36, confirmed at column resolution -- narrow and
+    # position-based like the axis-line band above, for the same reason
+    # (a real clipped-near-the-top curve is expected and must survive
+    # this, not just static UI chrome). This corner is exactly where the
+    # Stitcher's per-capture "new" tail lands (the rightmost/most-recent
+    # columns), so any capture where the real curve happened to be
+    # absent there had nothing else to stop these icons from winning by
+    # default -- confirmed live this fabricated a second, separate,
+    # repeated wrong value distinct from the axis-line one.
+    match[: int(0.039 * h), int(0.90 * w) :] = False
+    return match
+
+
+# --- Capture loop ----------------------------------------------------------
+
+
+@dataclass
+class RereadSample:
+    ts_ns: int
+    value_uv: Optional[float]
+
+
+def digitize_lone_curve_capture(
+    frame: Frame, bounds: PlotBounds, amp_min: Optional[float], amp_max: Optional[float], reference_ts_ns: int
+) -> List[Tuple[int, Optional[float]]]:
+    """One capture's worth of (ts_ns, value) for the single visible
+    curve.
+
+    ``reference_ts_ns`` is the RECORDING-relative instant this capture's
+    rightmost (most recent) column represents -- i.e. the original
+    recording's own start_ts_ns plus how far into replaying it this
+    capture landed -- NOT frame.capture_ts_ns (true wall-clock capture
+    time). Confirmed live this distinction is not cosmetic: a reread
+    pass runs at a completely different real-world time than the
+    original recording (hours or days later), so timestamping output
+    rows with wall-clock capture time produces a column that looks
+    superficially fine on its own but can never line up with the
+    original log's timestamps at all -- the very first real run's merge
+    silently produced two disjoint blocks of rows (original log's real
+    dates, reread's much-later real dates) instead of one aligned
+    timeline, since MERGE_BUCKET_NS-based bucketing has no way to match
+    timestamps that far apart.
+
+    EEG passes always pass real (amp_min, amp_max) -- exact linear
+    pixel->uV calibration, no axis OCR needed, since we set those values
+    ourselves via EmotivPRO's Amplitude min/max fields.
+
+    Motion passes pass (None, None): the Motion tab has no Amplitude
+    fields at all (confirmed live) and its Y axis autoscales per-capture
+    to values EmotivPRO chooses, not us -- turning that into real
+    engineering units would need OCR'ing axis labels that can include a
+    decimal point (e.g. "0.8"), which the existing digit-only glyph
+    classifier isn't safe to blindly apply to (a dropped "." silently
+    turns "0.8" into "8", a 10x error, worse than not calibrating at
+    all). Rather than fabricate a wrong absolute value, motion output is
+    the curve's position as a 0..1 FRACTION of the visible canvas height
+    (0=bottom edge, 1=top edge) -- honest about what was actually read,
+    at the cost of not being directly comparable in real units across
+    captures whose autoscaled range differs. See the module docstring
+    and README for this known limitation."""
+    plot_rgb = frame.rgb[bounds.y0 : bounds.y1, bounds.x0 : bounds.x1]
+    match = find_lone_curve_pixels(plot_rgb)
+    h = bounds.height
+    calibrated = amp_min is not None and amp_max is not None and amp_max != amp_min
+    if calibrated:
+        baseline_local = h * (amp_max / (amp_max - amp_min))
+    else:
+        baseline_local = h / 2
+    max_excursion_px = h  # the whole canvas -- there's only one curve, no neighbor to bleed into
+    from epoc_graph import digitize_curve  # local import to avoid polluting module namespace
+
+    rows = digitize_curve(match, baseline_local, max_excursion_px)
+    tick_calibration = read_axis_tick_labels(frame, bounds)
+    from epoc_graph import pixel_to_seconds_ago
+
+    uv_per_px = h / (amp_max - amp_min) if calibrated else None
+    out: List[Tuple[int, Optional[float]]] = []
+    for col, y in enumerate(rows):
+        x_abs = bounds.x0 + col
+        seconds_ago = pixel_to_seconds_ago(x_abs, bounds, tick_calibration)
+        ts_ns = reference_ts_ns - int(seconds_ago * 1e9)
+        if y is None:
+            out.append((ts_ns, None))
+        elif calibrated:
+            out.append((ts_ns, float(amp_max - y / uv_per_px)))
+        else:
+            out.append((ts_ns, float(1.0 - y / h)))
+    out.sort(key=lambda s: s[0])
+    return out
+
+
+def run_one_pass(
+    ui: EmotivProUI,
+    matched: "RecordingRow",
+    tab: str,
+    channel: str,
+    channels: List[str],
+    amp_min: Optional[float],
+    amp_max: Optional[float],
+    hp: Optional[bool],
+    max_duration_s: Optional[float],
+    poll_interval: float,
+    out_path: str,
+    verbose: bool,
+    recording_start_ns: Optional[int] = None,
+) -> List[Tuple[int, Optional[float]]]:
+    from epoc_graph import Stitcher
+
+    # Re-opening the recording is the FIRST thing every pass does, not
+    # just the first attempt's: run_pass_with_recovery retries by
+    # calling this function again from scratch, and re-navigating here
+    # (rather than assuming we're still looking at the right chart) is
+    # what makes that retry safe even if a disruption left the UI
+    # somewhere completely different (the Recordings list, another
+    # recording, a dialog, ...).
+    ui.open_recording(matched)
+    ui.snapshot_stable_state()
+    ui.ensure_paused()
+    ui.seek_to_start()
+    ui.click_icon(tab)
+    ui.select_only(tab, channel, channels)
+    if tab == "eeg":
+        # High-pass FIRST, amplitude SECOND -- confirmed live (the hard
+        # way) that toggling High-pass filter changes/resets the
+        # Amplitude min/max fields (presumably EmotivPRO re-fitting for
+        # the raw-vs-filtered signal's different range). Doing it the
+        # other way round -- amplitude then high-pass, as an earlier
+        # version did -- reliably left the Amplitude fields showing
+        # garbage relative to what was just set, 5/5 times reproduced,
+        # every time high-pass needed to be toggled off from its
+        # checked-by-default state.
+        ui.set_high_pass(bool(hp))
+        ui.set_amplitude(amp_min, amp_max)
+    # Belt-and-suspenders: select_only already verifies the panel it
+    # opened gets closed, but re-check right before playing regardless
+    # (cheap, and this is exactly the thing that silently wasted a full
+    # pass -- half the plot obscured under an open panel -- when it
+    # wasn't actually verified).
+    ui.close_panel_if_open(tab)
+    # No pre-play OCR read-back here (there used to be one): confirmed
+    # live (repeatedly) that this OCR path confidently misreads a
+    # VISUALLY VERIFIED CORRECT 4-digit Amplitude value differently
+    # every retry ("-4235" read as "-5255" once, "-122" another time,
+    # "-105" read as "-10" yet another time) -- pure noise, not signal.
+    # See _set_field's docstring for the full reasoning: the one real
+    # corruption mechanism found live (toggling High-pass filter
+    # resets/changes the Amplitude fields) is fixed at its actual root
+    # cause instead -- high-pass is always set BEFORE amplitude, see
+    # set_amplitude's call site above.
+    bounds_fn = find_plot_bounds if tab == "eeg" else motion_plot_bounds
+    value_col = "value_uv" if tab == "eeg" else "value_frac_of_visible_range"
+
+    # Written to a .tmp path and only renamed to out_path once the pass
+    # completes -- this is what lets main() treat "out_path already
+    # exists" as "this pass is done, skip it" and safely resume a run
+    # that was stopped and re-invoked (each pass is one continuous
+    # foreground invocation this script's own disruption-pause design
+    # requires; a run spanning many passes needs to be resumable across
+    # separate invocations of the whole script without ever mistaking a
+    # half-written file for a completed one).
+    #
+    # If a .tmp is already sitting here (this pass was disrupted and is
+    # being retried, or the whole run was stopped and re-invoked mid-pass),
+    # RESUME roughly where it left off instead of restarting the whole
+    # pass from 0: read its last timestamp, seek the scrub track to that
+    # fraction of the recording (seek_to_fraction), and keep appending to
+    # the same file. Confirmed live this matters a lot in practice -- a
+    # long recording disrupted repeatedly was wasting most of its
+    # progress on every restart. "Roughly" is fine: a few seconds of
+    # re-captured overlap is cheap, and Stitcher's timestamp dedup (seeded
+    # with the last row already written) cleanly drops it.
+    tmp_path = out_path + ".tmp"
+    resume_from_ns: Optional[int] = None
+    if recording_start_ns is not None and max_duration_s and os.path.exists(tmp_path):
+        try:
+            with open(tmp_path, newline="") as rf:
+                reader = csv.reader(rf)
+                next(reader, None)
+                last_ts = None
+                for row in reader:
+                    if row and row[0]:
+                        last_ts = int(row[0])
+            if last_ts is not None:
+                elapsed_s = (last_ts - recording_start_ns) / 1e9
+                if elapsed_s > poll_interval * 2:  # meaningful progress worth not throwing away
+                    resume_from_ns = last_ts
+        except Exception:
+            resume_from_ns = None
+
+    if resume_from_ns is not None:
+        elapsed_s = (resume_from_ns - recording_start_ns) / 1e9
+        if verbose:
+            sys.stderr.write(f"[pass] resuming {channel} at ~{elapsed_s:.0f}s/{max_duration_s:.0f}s (was {tmp_path})\n")
+        ui.seek_to_fraction(elapsed_s / max_duration_s)
+    else:
+        ui.seek_to_start()
+    ui.play()
+
+    stitcher = Stitcher(verbose=verbose, channels=[channel])
+    if resume_from_ns is not None:
+        stitcher.last_emitted_ts_ns = resume_from_ns
+    all_samples: List[Tuple[int, Optional[float]]] = []
+    file_mode = "a" if resume_from_ns is not None else "w"
+    with open(tmp_path, file_mode, newline="") as f:
+        writer = csv.writer(f)
+        if file_mode == "w":
+            writer.writerow(["timestamp_ns", "timestamp_iso", value_col])
+        f.flush()
+
+        class _RowWriter:
+            def write_row(self, ts_ns, values, quality):
+                v = values.get(channel)
+                writer.writerow([ts_ns, _iso_ns(ts_ns), "" if v is None else f"{v:.3f}"])
+                all_samples.append((ts_ns, v))
+
+            def flush(self):
+                f.flush()
+
+        row_writer = _RowWriter()
+        safety_cap_s = (max_duration_s + max(10.0, poll_interval * 3)) if max_duration_s else DEFAULT_MAX_DURATION_S
+        pass_start = time.monotonic()
+        if resume_from_ns is not None:
+            # Backdate pass_start by how far into the recording we
+            # resumed at: makes reference_ts_ns (recording_start_ns +
+            # elapsed-since-pass_start, below) and the deadline/debounce
+            # elapsed-time math below both correct with NO other special
+            # casing -- "elapsed since pass_start" now means "elapsed
+            # into the whole pass," true whether it started at 0 or was
+            # resumed partway through.
+            pass_start -= (resume_from_ns - recording_start_ns) / 1e9
+        deadline = pass_start + safety_cap_s
+        # End-of-playback used to be detected by the play/pause icon
+        # reverting to "paused" on its own. Confirmed live that read is
+        # simply unreliable during real continuous playback (see
+        # is_playing's docstring) -- in practice it made this debounce
+        # fire at a fixed ~90% of max_duration_s every time, regardless
+        # of where the video actually was, silently dropping the last
+        # ~10% of every pass. Detected instead from the SAME scrub
+        # handle position the periodic resync below already reads:
+        # genuinely reaching the end of the track is unambiguous and
+        # doesn't need debouncing the way a flickery icon read did.
+        min_elapsed_before_stop = MIN_PLAYING_BEFORE_STOP_S
+        if max_duration_s:
+            min_elapsed_before_stop = max(min_elapsed_before_stop, max_duration_s * 0.8)
+        last_resync = pass_start
+        while time.monotonic() < deadline:
+            t0 = time.monotonic()
+            # No click is happening during pure capture, so the pointer
+            # check has nothing concrete to protect here. Use the direct
+            # content-visibility check instead of focus -- confirmed
+            # with the user that clear content visibility is what
+            # actually matters (occlusion can happen without a focus
+            # change, and focus can flap without occlusion), and we're
+            # definitely in the chart view here so its assumption holds.
+            try:
+                ui.require_stable(check_pointer=False, check_focus=False, check_content=True)
+            except Disruption:
+                # Freeze the video the INSTANT a disruption is noticed,
+                # not just epoc-reread's own reading of it -- confirmed
+                # live that without this, EmotivPRO just kept playing
+                # for the entire time epoc-reread was stopped waiting
+                # for confirmation (in one real case, all the way to
+                # the recording's end, unattended) instead of sitting
+                # at the moment things went wrong. Doesn't change what
+                # run_pass_with_recovery does with the partial data
+                # (still restarts the whole pass -- see its docstring
+                # for why resuming mid-pass isn't attempted), but keeps
+                # a future disruption from silently burning the rest of
+                # the recording's runtime for nothing.
+                try:
+                    ui.ensure_paused()
+                except Exception:
+                    pass
+                raise  # caller (run_pass_with_recovery) restarts the whole pass
+            frame = ui.cap.capture_frame(verbose=verbose)
+            if frame is not None:
+                # Periodic resync against the scrub handle's actual
+                # position -- see read_scrub_fraction's docstring for why:
+                # playback isn't reliably 1x over a long pass, confirmed
+                # live to drift by hundreds of seconds uncorrected. Also
+                # doubles as the end-of-playback check (see above) since
+                # both need the same handle-position read.
+                now = time.monotonic()
+                if max_duration_s and recording_start_ns is not None and now - last_resync >= RESYNC_INTERVAL_S:
+                    frac = ui.read_scrub_fraction(frame)
+                    if frac is not None:
+                        resynced_elapsed_s = frac * max_duration_s
+                        prev_elapsed_s = now - pass_start
+                        # A wildly inconsistent read is more likely a
+                        # spurious color-match than a real jump (the
+                        # true drift observed live tops out around
+                        # 10-15% of elapsed, nowhere near half the
+                        # recording) -- skip rebasing rather than
+                        # risk corrupting the pass on a bad read.
+                        if abs(resynced_elapsed_s - prev_elapsed_s) < max_duration_s * 0.5:
+                            if verbose and abs(resynced_elapsed_s - prev_elapsed_s) > 1.0:
+                                sys.stderr.write(
+                                    f"[pass] resync: assumed elapsed {prev_elapsed_s:.1f}s, "
+                                    f"scrub handle reads {resynced_elapsed_s:.1f}s "
+                                    f"(correcting by {resynced_elapsed_s - prev_elapsed_s:+.1f}s)\n"
+                                )
+                            pass_start = now - resynced_elapsed_s
+                        if frac >= 0.99 and (now - pass_start) >= min_elapsed_before_stop:
+                            if verbose:
+                                sys.stderr.write(f"[pass] end-of-playback confirmed (scrub handle at {frac:.3f}) after {now - pass_start:.1f}s\n")
+                            break
+                    last_resync = now
+                bounds = bounds_fn(frame, verbose=verbose) if tab == "eeg" else bounds_fn(frame)
+                if bounds is not None:
+                    # Recording-relative, NOT frame.capture_ts_ns (true
+                    # wall-clock capture time) -- see
+                    # digitize_lone_curve_capture's docstring for why
+                    # that distinction matters for a REPLAY.
+                    if recording_start_ns is not None:
+                        reference_ts_ns = recording_start_ns + int((time.monotonic() - pass_start) * 1e9)
+                    else:
+                        reference_ts_ns = frame.capture_ts_ns
+                    samples = digitize_lone_curve_capture(frame, bounds, amp_min, amp_max, reference_ts_ns)
+                    from epoc_graph import CaptureResult
+
+                    result = CaptureResult(
+                        capture_ts_ns=reference_ts_ns,
+                        samples=[(ts, {channel: v}) for ts, v in samples],
+                        quality={},
+                        window_width=frame.width,
+                    )
+                    stitcher.process(result, row_writer)
+                    row_writer.flush()
+            sleep_for = poll_interval - (time.monotonic() - t0)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    try:
+        ui.ensure_paused()
+    except (RuntimeError, Disruption):
+        # The data is already flushed to tmp_path -- a failure here is
+        # just tidiness (leaving the video playing), not worth losing
+        # and re-running an otherwise-complete pass over.
+        pass
+    os.replace(tmp_path, out_path)
+    return all_samples
+
+
+MAX_PASS_RETRIES = 20
+
+
+def run_pass_with_recovery(
+    ui: EmotivProUI,
+    matched: "RecordingRow",
+    tab: str,
+    channel: str,
+    channels: List[str],
+    amp_min: Optional[float],
+    amp_max: Optional[float],
+    hp: Optional[bool],
+    max_duration_s: Optional[float],
+    poll_interval: float,
+    out_path: str,
+    verbose: bool,
+    recording_start_ns: Optional[int] = None,
+) -> List[Tuple[int, Optional[float]]]:
+    """Wraps one run_one_pass call with disruption recovery: if the UI
+    turns out to already be unstable before starting, or run_one_pass
+    aborts partway through (a Disruption raised by its own periodic
+    ui.require_stable() checks, or one of EmotivProUI's existing
+    "clicking X didn't produce Y" RuntimeErrors -- both mean something
+    other than epoc-reread touched the UI), this pauses for the user to
+    confirm it's safe, then restarts the ENTIRE pass from scratch
+    (open_recording -> ... -> play) rather than trying to resume
+    mid-pass, since there's no way to know what a human left on screen.
+    Never runs unattended for longer than one pass without a chance to
+    notice something went wrong."""
+    for attempt in range(1, MAX_PASS_RETRIES + 1):
+        ok, reason = ui.is_stable()
+        if not ok:
+            ui.pause_for_confirmation(reason)
+        try:
+            return run_one_pass(
+                ui, matched, tab, channel, channels, amp_min, amp_max, hp,
+                max_duration_s, poll_interval, out_path, verbose,
+                recording_start_ns=recording_start_ns,
+            )
+        except Disruption as e:
+            sys.stderr.write(f"[disrupted] {channel}: {e} (attempt {attempt}/{MAX_PASS_RETRIES})\n")
+            ui.pause_for_confirmation(str(e))
+        except RuntimeError as e:
+            sys.stderr.write(
+                f"[disrupted] {channel}: a UI verification step failed ({e}) -- "
+                f"treating as a disruption (attempt {attempt}/{MAX_PASS_RETRIES})\n"
+            )
+            ui.pause_for_confirmation(str(e))
+    raise RuntimeError(f"{channel}: gave up after {MAX_PASS_RETRIES} disrupted attempts")
+
+
+# --- Common-timespan report ------------------------------------------------
+
+
+def _exclude_clipped(series: List[Tuple[int, float]], tol_frac: float = 0.02) -> List[Tuple[int, float]]:
+    """Drops points within tol_frac of the series' own observed |max| --
+    a generic proxy for "pinned at a display/range boundary, not a real
+    reading" that needs no knowledge of which UI clipped it or at what
+    exact value (a live epoc-record capture's boundary depends on
+    Channel spacing x 14 rows; a reread pass's depends on that pass's
+    own amp_min/amp_max -- both vary per channel/run)."""
+    if not series:
+        return series
+    vals = np.abs(np.array([v for _, v in series], dtype=np.float64))
+    cap = float(vals.max())
+    if cap == 0:
+        return series
+    thresh = cap * (1 - tol_frac)
+    return [(t, v) for t, v in series if abs(v) < thresh]
+
+
+def _bin_signed_mean(series_s: List[Tuple[float, float]], t0: float, t1: float, bin_s: float) -> np.ndarray:
+    """Bins into bin_s-wide windows over [t0, t1], averaging the SIGNED
+    value per bin. Unlike an amplitude envelope (max |v| per bin), this
+    keeps the waveform's shape (rises, falls, sign) -- confirmed live
+    that shape-preserving binning finds a far sharper, higher-confidence
+    correlation peak for real EEG than an envelope-only comparison,
+    since two same-channel captures of literally the same signal share
+    the same trace, not just the same amplitude envelope."""
+    n_bins = int(np.ceil((t1 - t0) / bin_s)) + 1
+    sums = np.zeros(n_bins)
+    counts = np.zeros(n_bins)
+    for t, v in series_s:
+        i = int((t - t0) / bin_s)
+        if 0 <= i < n_bins:
+            sums[i] += v
+            counts[i] += 1
+    out = np.full(n_bins, np.nan)
+    nz = counts > 0
+    out[nz] = sums[nz] / counts[nz]
+    return out
+
+
+def cross_correlate_offset(
+    reread: List[Tuple[int, Optional[float]]],
+    log_series: List[Tuple[int, float]],
+    max_lag_s: float = 60.0,
+    bin_s: float = 0.2,
+) -> Optional[Tuple[float, float, int]]:
+    """Best-fit (lag_seconds, correlation, n_bins) between the reread
+    series and the input log's same-channel series, searching a wide
+    range of lags. Informational only (see epoc-reread's module
+    docstring) -- nothing downstream trims or rewrites data based on
+    this, it just gets written into FILENAME.match-report.txt.
+
+    Landmark/waveform-based: both series are clipping-excluded (see
+    _exclude_clipped) then binned into bin_s windows by SIGNED mean
+    (see _bin_signed_mean, not an amplitude envelope) before the lag
+    sweep, so a large-amplitude artifact's actual shape over time acts
+    as the alignment landmark, not just its magnitude. This is a strict
+    upgrade over a naive point-wise nearest-neighbor match (the
+    approach originally here): the point-wise version needs the two
+    series' own sample times to coincide within a tight tolerance,
+    which almost never happens between two independently-timed OCR
+    captures at different sampling rates, so it starved on real data
+    (confirmed live: <10 comparable points and correlation ~0.03-0.17
+    even at the correct lag). Binning first removes that timing
+    mismatch as a confound; confirmed live this reliably finds
+    correlation >0.4-0.9 at the true lag once the true lag is within
+    max_lag_s (it was NOT, before the recording_start_ns anchoring fix
+    -- see --recording-start -- which is why max_lag_s defaults wider
+    here, 60s, than the old 30s: legitimate residual drift/setup-latency
+    lag is still expected to be small once anchored correctly, but not
+    as tightly bounded as point-wise matching assumed)."""
+    reread_clean = _exclude_clipped([(ts, v) for ts, v in reread if v is not None])
+    log_clean = _exclude_clipped(log_series)
+    if len(reread_clean) < 20 or len(log_clean) < 20:
+        return None
+    r_series_s = [(t / 1e9, v) for t, v in reread_clean]
+    l_series_s = [(t / 1e9, v) for t, v in log_clean]
+    r_t0 = min(t for t, _ in r_series_s)
+    r_t1 = max(t for t, _ in r_series_s)
+    l_t0 = min(t for t, _ in l_series_s)
+    l_t1 = max(t for t, _ in l_series_s)
+    t0 = min(r_t0, l_t0 - max_lag_s)
+    t1 = max(r_t1, l_t1 + max_lag_s)
+    r_bin = _bin_signed_mean(r_series_s, t0, t1, bin_s)
+    l_bin = _bin_signed_mean(l_series_s, t0, t1, bin_s)
+
+    best: Optional[Tuple[float, float, int]] = None
+    max_shift_bins = int(max_lag_s / bin_s)
+    for shift in range(-max_shift_bins, max_shift_bins + 1):
+        if shift >= 0:
+            a = r_bin[shift:]
+            b = l_bin[: len(a)]
+        else:
+            b = l_bin[-shift:]
+            a = r_bin[: len(b)]
+        mask = ~np.isnan(a) & ~np.isnan(b)
+        n = int(mask.sum())
+        if n < 20:
+            continue
+        av, bv = a[mask], b[mask]
+        if av.std() < 1e-9 or bv.std() < 1e-9:
+            continue
+        corr = float(np.corrcoef(av, bv)[0, 1])
+        if best is None or corr > best[1]:
+            best = (shift * bin_s, corr, n)
+    return best
+
+
+def append_match_report(
+    report_path: str,
+    channel: str,
+    pass_tag: str,
+    recording_name_hint: str,
+    offset_result: Optional[Tuple[float, float, int]],
+    clipped_warning: bool,
+) -> None:
+    with open(report_path, "a") as f:
+        if offset_result is not None:
+            lag, corr, n = offset_result
+            f.write(
+                f"{channel} {pass_tag}: matched {recording_name_hint}, "
+                f"lag={lag:+.2f}s corr={corr:.3f} n={n}\n"
+            )
+        else:
+            f.write(f"{channel} {pass_tag}: no confident cross-correlation offset found\n")
+        if clipped_warning:
+            f.write(
+                f"{channel} {pass_tag}: WARNING re-read values touch this pass's amplitude "
+                "boundary -- the wide pass may still be clipped; re-run with a larger "
+                "--wide-factor for this channel\n"
+            )
+
+
+# --- Final merge: FILENAME.reread.csv --------------------------------------
+
+MERGE_BUCKET_NS = 1_000_000  # 1ms: two samples within this land in the same output row
+
+
+def read_value_csv(path: str) -> List[Tuple[int, float]]:
+    """Reads a pass CSV written by run_one_pass (timestamp_ns,
+    timestamp_iso, value_*) back into (ts_ns, value) pairs, skipping
+    blank (unreadable-that-capture) rows -- never a fabricated value."""
+    out: List[Tuple[int, float]] = []
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for row in reader:
+            if len(row) < 3 or not row[2]:
+                continue
+            try:
+                out.append((int(row[0]), float(row[2])))
+            except ValueError:
+                continue
+    return out
+
+
+def merge_channel_series(sources: List[List[Tuple[int, float]]]) -> Dict[int, float]:
+    """Bucketed first-source-wins merge across an arbitrary number of
+    (ts_ns, value) series, `sources` given BEST-RESOLUTION FIRST.
+
+    Every source keeps its own real, independently-digitized timestamps
+    (never interpolated/re-aligned) -- they're just grouped into
+    MERGE_BUCKET_NS-wide buckets so multiple sources' samples that land
+    within the same ~1ms both count as "the same instant" rather than
+    creating near-duplicate rows a few microseconds apart. A bucket is
+    filled by the FIRST (highest-priority = finest y-resolution) source
+    that has a sample there; once filled it's never overwritten by a
+    later, coarser source -- this is what gives the merged column both
+    better Y resolution (finer passes win wherever they have data) and
+    better X resolution (coarser/independent sources -- the original
+    log, or a wider pass -- fill in time buckets no finer source ever
+    sampled)."""
+    merged: Dict[int, float] = {}
+    for series in sources:
+        for ts_ns, value in series:
+            bucket = round(ts_ns / MERGE_BUCKET_NS) * MERGE_BUCKET_NS
+            if bucket not in merged:
+                merged[bucket] = value
+    return merged
+
+
+def build_reread_csv(
+    out_path: str,
+    eeg_merged: Dict[str, Dict[int, float]],
+    motion_merged: Dict[str, Dict[int, float]],
+) -> None:
+    """Writes the final combined FILENAME.reread.csv: one row per
+    distinct (bucketed) timestamp seen in ANY per-channel merged series,
+    columns for all 14 EEG channels (so the file always has the same
+    electrode columns as an epoc-record log, even for electrodes this
+    run didn't personally re-read -- see main()'s fallback-to-log-only
+    behavior for those) plus, only if any motion data was produced, the
+    10 motion sensor columns. A blank cell means genuinely no sample at
+    that instant in any contributing source -- never interpolated,
+    matching every other CSV this project writes."""
+    motion_present = bool(motion_merged)
+    value_channels = list(CHANNELS) + (list(MOTION_CHANNELS) if motion_present else [])
+
+    all_ts = set()
+    for d in eeg_merged.values():
+        all_ts.update(d.keys())
+    for d in motion_merged.values():
+        all_ts.update(d.keys())
+    sorted_ts = sorted(all_ts)
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp_ns", "timestamp_iso"] + value_channels)
+        for ts_ns in sorted_ts:
+            row = [str(ts_ns), _iso_ns(ts_ns)]
+            for ch in value_channels:
+                d = eeg_merged.get(ch) if ch in CHANNELS else motion_merged.get(ch)
+                v = (d or {}).get(ts_ns)
+                row.append("" if v is None else f"{v:.3f}")
+            writer.writerow(row)
+
+
+# --- Main ------------------------------------------------------------------
+
+
+def parse_channels_arg(spec: Optional[str]) -> List[str]:
+    if not spec:
+        return list(CHANNELS)
+    wanted = [c.strip().upper() for c in spec.split(",") if c.strip()]
+    unknown = [c for c in wanted if c not in CHANNELS]
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown channel(s): {', '.join(unknown)}")
+    return wanted
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("logfile", help="epoc-record output CSV (optionally .gz)")
+    parser.add_argument(
+        "--realtime-budget", type=float, default=DEFAULT_REALTIME_BUDGET,
+        help="Y-axis precision, expressed as multiples of the recording's own duration to spend "
+        "PER ELECTRODE (default %(default)s). Spent in priority order: 1x=fine (tight range from "
+        "the log's own values, best resolution of the normal signal), 2x=+wide/auto (generous "
+        "range to recover clipped/off-screen extremes), >2x=+ extra levels interpolated between "
+        "them. Does not include --with-high-pass, which doubles whatever this buys.",
+    )
+    parser.add_argument("--wide-factor", type=float, default=DEFAULT_WIDE_FACTOR, help="wide pass = this x the log's observed |value| max (default %(default)s)")
+    parser.add_argument(
+        "--with-high-pass", action="store_true",
+        help="also re-read every level --realtime-budget selects with EmotivPRO's High-pass "
+        "filter on (doubles the time spent per electrode) -- a separate opt-in rather than part "
+        "of the budget since it's a different signal (filtered vs raw), not a precision tier",
+    )
+    parser.add_argument("--motion-too", action="store_true", help="also re-read the 10 Motion sensors (Q0-3, ACCX/Y/Z, MAGX/Y/Z), one autoscaled pass each")
+    parser.add_argument("--channels", type=parse_channels_arg, default=None, help="comma-separated subset of EEG channels to re-read (default: all 14)")
+    parser.add_argument(
+        "--recording-index", type=int, default=None,
+        help="skip automatic (OCR-based, best-effort only) matching; use the Nth row (1-based, "
+        "from the top as currently sorted/displayed) in the Recordings list instead",
+    )
+    parser.add_argument(
+        "--duration", type=float, default=None,
+        help="the recording's known duration in seconds (e.g. read off the Recordings list by eye). "
+        "Strongly recommended together with --recording-index, which has no OCR'd duration of its "
+        "own: without --duration, end-of-playback relies entirely on the play/pause-icon debounce; "
+        "when given, no pass ever stops before ~90%% of it regardless of what that icon looks like",
+    )
+    parser.add_argument(
+        "--recording-start", default=None, type=parse_recording_start_arg,
+        help='the recording\'s actual Date Collected, "DD/MM/YYYY HH:MM:SS" local time (e.g. read off '
+        "the Recordings list, or the window title bar once opened, by eye). Anchors every reread "
+        "sample's recording-relative timestamp -- REQUIRED for the output to line up with the "
+        "original log at all: confirmed live that falling back to the LOG's own start time (its "
+        "first row) instead of the recording's real start silently offset an entire run by however "
+        "far into the log the recording actually began (a real case: ~773s, since the matched "
+        "recording started well after the log itself did) -- every pass looked internally fine but "
+        "was systematically misaligned against the log by that whole amount.",
+    )
+    parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL, help="seconds between captures during a pass (default %(default)s)")
+    parser.add_argument("--match-tolerance", type=float, default=DEFAULT_MATCH_TOLERANCE_S, help="seconds of padding applied to both spans when matching (default %(default)s)")
+    parser.add_argument("--output-dir", default=".", help="directory for output CSVs and the match-report (default: current directory)")
+    parser.add_argument("--dry-run", action="store_true", help="match + plan only, never touch the EmotivPRO window")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    args = parser.parse_args()
+
+    channels = args.channels if args.channels is not None else list(CHANNELS)
+    log = read_log(args.logfile, CHANNELS + (MOTION_CHANNELS if args.motion_too else []))
+    basename = os.path.basename(args.logfile)
+    if basename.endswith(".gz"):
+        basename = basename[: -len(".gz")]
+
+    stats_by_channel: Dict[str, LogChannelStats] = {}
+    for ch in channels:
+        st = compute_channel_stats([v for _, v in log.series.get(ch, [])])
+        if st is not None:
+            stats_by_channel[ch] = st
+
+    d = display.Display()
+    cap = Capture(d)
+    # A few retries: confirmed live that the Xlib window-tree walk can
+    # transiently fail to find an EmotivPRO window that plain `xdotool
+    # search` finds fine a moment later (and a moment before) -- not a
+    # real absence, just a momentary X11 hiccup, same character as the
+    # other transient failures this script has had to tolerate.
+    for attempt in range(5):
+        cap.locate(force=True)
+        if cap.window is not None:
+            break
+        time.sleep(1.0)
+    if cap.window is None:
+        sys.stderr.write("[error] EmotivPRO window not found\n")
+        sys.exit(1)
+    window_id = cap.window.id
+    xdo = Xdo(window_id, verbose=args.verbose)
+    ui = EmotivProUI(cap, xdo, verbose=args.verbose)
+
+    # Actively take control before establishing the "stable" baseline
+    # is_stable() checks against -- otherwise whatever window happened
+    # to be focused when this script was started (e.g. the terminal it
+    # was launched from) would immediately look like a disruption on
+    # the very first check, before epoc-reread has done anything itself.
+    xdo.activate()
+    time.sleep(0.3)
+    ui.snapshot_stable_state()
+
+    ui.go_to_recordings_list()
+
+    if args.recording_index is not None:
+        # OCR-free, 100% reliable selection: just the Nth row from the
+        # top of the currently-displayed list. Preferred over automatic
+        # matching (see below) whenever it's available.
+        idx = args.recording_index - 1
+        matched = RecordingRow(
+            row_index=idx, name_y=RECORDINGS_ROW0_Y_PX + idx * RECORDINGS_ROW_STEP_PX,
+            duration_s=args.duration, start_ts_ns=args.recording_start,
+        )
+        sys.stderr.write(f"[match] using --recording-index {args.recording_index} (row {idx}), no OCR\n")
+        if args.recording_start is None:
+            sys.stderr.write(
+                "[warn] no --recording-start given -- reread timestamps will fall back to the LOG's "
+                "own start time, which is WRONG unless the recording happens to start at the same "
+                "instant the log does (confirmed live it usually doesn't). Pass --recording-start "
+                '"DD/MM/YYYY HH:MM:SS" (read it off the window title bar once the recording is open) '
+                "for output that actually lines up with the original log.\n"
+            )
+        if args.duration is None:
+            sys.stderr.write(
+                "[warn] no --duration given -- end-of-playback relies entirely on the "
+                "play/pause-icon debounce; pass --duration SECONDS if you know it "
+                "(strongly recommended, see the confirmed-live false-stop this fixes)\n"
+            )
+    else:
+        # Best-effort automatic matching: OCR the Date Collected/Duration
+        # cells and overlap them against the log's span. Confirmed live
+        # that this table renders in a font the digit-template matcher
+        # doesn't reliably read (fragmented/ambiguous glyphs, unlike the
+        # x-axis tick labels and Channel-spacing box it was calibrated
+        # against) -- it still fails CLOSED most of the time (a garbled
+        # read only rarely happens to produce exactly 14/6 digit
+        # characters), but a wrong-but-plausible match is possible and
+        # would silently corrupt a very long run. Prefer --recording-index
+        # once you know which row you want; this path exists for the
+        # first pass at finding it.
+        rows = read_recordings_table(cap, verbose=args.verbose)
+        if args.verbose:
+            for r in rows:
+                sys.stderr.write(f"[recordings] row {r.row_index}: start={r.start_ts_ns} duration={r.duration_s}s\n")
+        matched = match_recording(log, rows, tolerance_s=args.match_tolerance, verbose=args.verbose)
+        if matched is None:
+            sys.stderr.write(
+                f"[error] no Recordings-list row overlaps {args.logfile}'s time span "
+                f"[{log.start_ts_ns}, {log.end_ts_ns}] within +/-{args.match_tolerance}s, "
+                "and no --recording-index given.\n"
+                "Look at the Recordings list yourself and pass --recording-index "
+                "(1-based, counting from the top row as currently sorted/displayed).\n"
+            )
+            sys.exit(1)
+        sys.stderr.write(
+            f"[match] row {matched.row_index}: start={matched.start_ts_ns} duration={matched.duration_s}s "
+            "-- ONLY as reliable as the table OCR above; verify against the on-screen list "
+            "before trusting a long run to it, or pass --recording-index instead.\n"
+        )
+
+    # The anchor for every reread sample's recording-relative timestamp.
+    # matched.start_ts_ns is set from --recording-start (--recording-index
+    # path) or OCR (auto-match path); log.start_ts_ns is only a fallback
+    # for when neither is available, and is WRONG whenever the recording
+    # didn't start at the exact same instant the log did (see
+    # --recording-start's help text -- confirmed live this is the
+    # common case, not the exception).
+    if matched.start_ts_ns is not None:
+        recording_start_ns = matched.start_ts_ns
+    else:
+        recording_start_ns = log.start_ts_ns
+        sys.stderr.write("[warn] using the log's own start time as the recording-time anchor (see --recording-start)\n")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    report_path = os.path.join(args.output_dir, f"{basename}.match-report.txt")
+
+    n_levels = max(1, int(args.realtime_budget))
+    hp_multiplier = 2 if args.with_high_pass else 1
+    total_passes = len(channels) * n_levels * hp_multiplier + (len(MOTION_CHANNELS) if args.motion_too else 0)
+    duration_known = matched.duration_s is not None
+    duration_str = f"{matched.duration_s:.0f}s" if duration_known else f"unknown (safety cap {DEFAULT_MAX_DURATION_S/3600:.0f}h/pass)"
+    if duration_known:
+        est_seconds = total_passes * matched.duration_s
+        print(f"Matched recording: row {matched.row_index}, duration {duration_str}")
+        print(f"Planned passes: {total_passes} (~{est_seconds/3600:.1f}h estimated)")
+    else:
+        print(f"Matched recording: row {matched.row_index}, duration {duration_str}")
+        print(f"Planned passes: {total_passes} (duration unknown -- can't estimate total time)")
+    for ch in channels:
+        st = stats_by_channel.get(ch)
+        if st is None:
+            print(f"  {ch}: no observed values in log -- will use floor-only wide range")
+            levels = plan_zoom_levels(
+                LogChannelStats(0.0, -10.0, 10.0, 0), args.realtime_budget, args.wide_factor, DEFAULT_WIDE_FLOOR_UV
+            )
+        else:
+            levels = plan_zoom_levels(st, args.realtime_budget, args.wide_factor, DEFAULT_WIDE_FLOOR_UV)
+        print(f"  {ch}: " + ", ".join(f"{tag}[{lo:.0f},{hi:.0f}]" for lo, hi, tag in levels))
+
+    if args.dry_run:
+        return
+
+    # Tracks, per channel, the pass files just written along with their
+    # amplitude-range width (finer = lower width = higher merge
+    # priority) so the final merge (below) can rank them without having
+    # to re-parse filenames.
+    eeg_pass_files: Dict[str, List[Tuple[float, str]]] = {ch: [] for ch in channels}
+
+    for ch in channels:
+        st = stats_by_channel.get(ch) or LogChannelStats(0.0, -10.0, 10.0, 0)
+        levels = plan_zoom_levels(st, args.realtime_budget, args.wide_factor, DEFAULT_WIDE_FLOOR_UV)
+        hp_states = (False, True) if args.with_high_pass else (False,)
+        for amp_min, amp_max, tag in levels:
+            range_tag = tag_for_range(amp_min, amp_max) if tag != "wide" else "auto"
+            for hp in hp_states:
+                suffix = ".hp" if hp else ""
+                out_path = os.path.join(args.output_dir, f"{basename}.{ch}.{range_tag}{suffix}")
+                if os.path.exists(out_path):
+                    # Resuming a run stopped and re-invoked earlier (this
+                    # script must be run attended/foreground -- see the
+                    # module docstring -- so a multi-hour run is expected
+                    # to span several separate invocations): a pass file
+                    # only ever exists at its final name once fully
+                    # written (run_one_pass writes to out_path+".tmp" and
+                    # renames only on completion), so its presence alone
+                    # means this exact pass is already done.
+                    sys.stderr.write(f"[skip] {ch} [{amp_min},{amp_max}] hp={hp} -> {out_path} (already done)\n")
+                    samples = read_value_csv(out_path)
+                else:
+                    sys.stderr.write(f"[pass] {ch} [{amp_min},{amp_max}] hp={hp} -> {out_path}\n")
+                    # NOTE: the channel-selector panel always shows all 14
+                    # EEG channels regardless of --channels, so its
+                    # checkbox GRID POSITIONS must be built from the full
+                    # CHANNELS list here, not the (possibly narrower)
+                    # requested subset -- only `ch` itself (which one to
+                    # isolate) depends on --channels.
+                    samples = run_pass_with_recovery(
+                        ui, matched, "eeg", ch, CHANNELS, amp_min, amp_max, hp,
+                        matched.duration_s, args.poll_interval, out_path, args.verbose,
+                        recording_start_ns=recording_start_ns,
+                    )
+                    clipped = any(v is not None and (abs(v - amp_max) < 1e-6 or abs(v - amp_min) < 1e-6) for _, v in samples)
+                    offset = cross_correlate_offset(samples, log.series.get(ch, []))
+                    append_match_report(report_path, ch, f"{range_tag}{suffix}", f"row{matched.row_index}", offset, clipped)
+                eeg_pass_files[ch].append((amp_max - amp_min, out_path))
+
+    motion_pass_files: Dict[str, str] = {}
+    if args.motion_too:
+        for ch in MOTION_CHANNELS:
+            out_path = os.path.join(args.output_dir, f"{basename}.{ch}")
+            if os.path.exists(out_path):
+                sys.stderr.write(f"[skip] motion {ch} -> {out_path} (already done)\n")
+            else:
+                sys.stderr.write(f"[pass] motion {ch} -> {out_path}\n")
+                samples = run_pass_with_recovery(
+                    ui, matched, "motion", ch, MOTION_CHANNELS, None, None, None,
+                    matched.duration_s, args.poll_interval, out_path, args.verbose,
+                    recording_start_ns=recording_start_ns,
+                )
+                offset = cross_correlate_offset(samples, log.series.get(ch, []))
+                append_match_report(report_path, ch, "auto", f"row{matched.row_index}", offset, False)
+            motion_pass_files[ch] = out_path
+
+    # Final merge: for each of the 14 EEG channels, combine every pass
+    # this run wrote for it (finest amplitude range first) with the
+    # original log's own column for that channel -- see
+    # merge_channel_series's docstring for why priority order alone
+    # (no re-alignment) gives both better Y resolution (finer passes
+    # win) and better X resolution (the log, and any pass this run
+    # didn't bother re-reading finely, fill remaining time buckets).
+    # Channels this run never touched (outside --channels) fall back to
+    # just their original log column, so the merged file always has all
+    # 14 electrode columns like a normal epoc-record log does.
+    eeg_merged: Dict[str, Dict[int, float]] = {}
+    for ch in CHANNELS:
+        log_series = log.series.get(ch, [])
+        if ch in eeg_pass_files and eeg_pass_files[ch]:
+            ranked_paths = [p for _, p in sorted(eeg_pass_files[ch], key=lambda t: t[0])]
+            sources = [read_value_csv(p) for p in ranked_paths] + [log_series]
+        else:
+            sources = [log_series]
+        eeg_merged[ch] = merge_channel_series(sources)
+
+    motion_merged: Dict[str, Dict[int, float]] = {}
+    for ch, path in motion_pass_files.items():
+        motion_merged[ch] = merge_channel_series([read_value_csv(path)])
+
+    reread_csv_path = os.path.join(args.output_dir, f"{basename}.reread.csv")
+    build_reread_csv(reread_csv_path, eeg_merged, motion_merged)
+
+    print(f"Done. See {report_path} for the common-timespan report.")
+    print(f"Combined output: {reread_csv_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -5,6 +5,11 @@ screen capture) and streams the result as CSV on stdout, in a format the
 sibling [`mudrarecord`](https://github.com/obo/mudrarecord)'s
 [`live-viewer`](https://github.com/obo/mudrarecord/live-viewer) can plot live.
 
+The screen-reading machinery (window capture, OCR, plot geometry, curve
+digitization, stitching) lives in the shared module `epoc_graph.py`. The
+companion script [`epoc-reread`](#epoc-reread) reuses it to *actively*
+re-read a stored recording at higher fidelity -- see below.
+
 ## Why
 
 EmotivPRO doesn't expose per-electrode EEG. The live
@@ -188,6 +193,75 @@ reports the affected channels as unreadable for that one tick rather than
 fabricate anything, and recovers on the next capture once the resize
 settles. See `f17_1012x799.png`/`.csv` in the fixtures below for a
 captured example.
+
+## epoc-reread
+
+`epoc-reread` actively drives EmotivPRO's own replay UI (simulated
+`xdotool` clicks -- unlike `epoc-record`, this is NOT passive) to
+re-digitize a *stored* recording one electrode (or, with `--motion-too`,
+one motion sensor) at a time, at much higher fidelity than the live
+14-at-once view allows.
+
+```bash
+./venv/bin/python epoc-reread log.20260814-1659.gz --dry-run   # plan only, no clicking
+./venv/bin/python epoc-reread log.20260814-1659.gz --recording-index 1 --channels AF3,F7
+```
+
+Given an `epoc-record` log, it finds the EmotivPRO window, tries to
+identify the matching row in the Recordings list by OCR'ing each row's
+Date Collected/Duration and overlapping that against the log's own
+(approximate) time span, opens it, and for each electrode reads two
+passes by default (`--zooms`): a **fine** range (tight, from the log's
+own observed values, for maximum resolution) and a **wide** range (a
+generous multiple of the log's observed extreme, since a value that was
+off-screen in the original capture shows up as *missing*, not wrong --
+EmotivPRO's own "Autoscale" button turned out, confirmed live, to just
+reset to its fixed default rather than truly autofit, so it isn't used).
+Each (zoom level x high-pass-filter-on/off) combination is its own pass,
+written incrementally to `LOGFILE.ELECTRODE.RANGE[.hp]`, plus a
+`LOGFILE.match-report.txt` with a cross-correlation-based "how well does
+this line up with the original log" check per pass.
+
+**The automatic Recordings-list match is best-effort, not certain**: that
+table renders in a font the digit-template OCR doesn't read as reliably
+as the contexts `epoc-record` itself relies on (confirmed live). It fails
+closed most of the time, but given how long a real run takes, confirm the
+matched row against what's on screen yourself, or skip the guesswork
+entirely with `--recording-index N` (1-based, counting from the top of
+the currently-displayed list -- no OCR involved at all).
+
+**Motion sensors** (`--motion-too`) have no Amplitude/High-pass controls
+in EmotivPRO at all (confirmed live) -- one autoscaled pass per sensor,
+written as `LOGFILE.SENSOR` with a `value_frac_of_visible_range` column
+(0..1 within whatever range EmotivPRO auto-picked that capture) rather
+than a fabricated absolute unit, since that axis's own tick labels
+render too small for reliable OCR.
+
+**Runtime is long**: replay runs at ~1x realtime (confirmed live), so
+N electrodes x Z zoom levels x 2 filter states x a D-long recording takes
+roughly N*Z*2*D just for EEG. Use `--channels`/`--zooms`/`--dry-run` to
+scope a test run before committing to a full one.
+
+**Must run attended, in the foreground -- never in the background
+(`&`/`nohup`/etc).** It shares the mouse/keyboard/window with whatever
+else you're doing, and before every click and periodically during a pass
+it checks the EmotivPRO window is still the size/focus it left it at and
+the pointer hasn't moved on its own; the moment that's no longer true, it
+stops, prints what it saw, and waits on stdin for you to confirm before
+resuming (from the start of the current pass, not mid-action). Give it
+`--duration SECONDS` whenever you know the recording's real length,
+especially with `--recording-index` (which has no OCR'd duration of its
+own) -- confirmed live that the play/pause-icon end-of-playback detection
+alone can misfire and truncate a pass early; `--duration` is a hard floor
+that overrides it.
+
+At the end of a run, all of a run's per-electrode/per-sensor pass files
+are combined into one `LOGFILE.reread.csv` (all 14 electrode columns,
+plus the 10 motion columns if `--motion-too` was used): per electrode,
+the finest-resolution pass that has a real sample at a given instant
+wins, falling back to coarser passes and finally the original log to
+fill in anything a pass didn't cover -- never interpolated, so a blank
+cell still means no source had a real reading there.
 
 ## Testing against real captures
 

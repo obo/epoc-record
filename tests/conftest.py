@@ -1,27 +1,23 @@
-import importlib.util
 import os
 import sys
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 
-# The module under test lives in the repo root as `epoc-record` (no .py
-# extension, matching this project's other command-line tools), so it can't
-# be found by a plain `import screenrecord`, and its extension-less filename
-# also isn't auto-recognized as source by spec_from_file_location -- an
-# explicit SourceFileLoader is needed. Load it explicitly from its file path
-# and register it in sys.modules under the name every test module imports
-# it as, so their own plain `import screenrecord as sr` resolves from the
-# cache without needing to know the real on-disk filename.
-_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "epoc-record")
-_loader = SourceFileLoader("screenrecord", _SCRIPT_PATH)
-_spec = importlib.util.spec_from_loader("screenrecord", _loader)
-sr = importlib.util.module_from_spec(_spec)
+# The module under test, `epoc_graph.py`, lives in the repo root, which
+# isn't necessarily on sys.path when pytest is invoked from elsewhere --
+# add it explicitly. Every test module does `import screenrecord as sr`
+# (that name predates the epoc_graph/epoc-record split, back when all of
+# this lived directly in a script called `epoc-record` -- kept as-is
+# throughout the test suite rather than a mechanical rename of every test
+# file); register the real module under that legacy name too so those
+# imports keep resolving unchanged.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import epoc_graph as sr  # noqa: E402
+
 sys.modules["screenrecord"] = sr
-_loader.exec_module(sr)
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 

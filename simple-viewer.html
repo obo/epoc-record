@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>simple-viewer</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --border:#d7dbe0; --text:#1a1d21; --muted:#6b7280;
+    --accentA:#2b6cb0; --accentB:#dd6b20; --grid:#e5e7eb; --good:#15803d; --bad:#b91c1c;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#15181c; --panel:#1e2227; --border:#333941; --text:#e6e8eb; --muted:#9aa2ad;
+      --accentA:#6ea8e0; --accentB:#f0a35f; --grid:#2c3138; --good:#4ade80; --bad:#f87171;
+    }
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);}
+  header{padding:10px 14px;border-bottom:1px solid var(--border);background:var(--panel);}
+  header h1{font-size:15px;margin:0 0 2px 0;}
+  header p{margin:0;color:var(--muted);font-size:12px;}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin:10px 14px;}
+  .row{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;}
+  .col{display:flex;flex-direction:column;gap:4px;min-width:230px;}
+  label.field-label{font-weight:600;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.03em;}
+  .fileinfo{font-size:12px;color:var(--muted);min-height:34px;white-space:pre-line;}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle;}
+  input[type=file]{font-size:12px;}
+  .controls-row{display:flex;flex-wrap:wrap;gap:18px;align-items:center;}
+  .controls-row > div{display:flex;align-items:center;gap:6px;}
+  select,button,input[type=number]{font:inherit;padding:3px 6px;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--text);}
+  button{cursor:pointer;}
+  button:hover{background:var(--grid);}
+  input[type=range]{width:150px;}
+  #scrub{width:100%;}
+  #channelChecks{display:flex;flex-wrap:wrap;gap:10px;}
+  #channelChecks label{display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;}
+  #channels{display:flex;flex-direction:column;gap:10px;margin:10px 14px 20px;}
+  .chan-block{background:var(--panel);border:1px solid var(--border);border-radius:6px;overflow:hidden;}
+  .chan-head{display:flex;justify-content:space-between;align-items:center;padding:5px 10px;border-bottom:1px solid var(--border);font-size:12px;flex-wrap:wrap;gap:6px;}
+  .chan-head .name{font-weight:700;}
+  .chan-head .corr{color:var(--muted);}
+  .chan-head .corr b{color:var(--text);}
+  canvas{display:block;width:100%;height:170px;cursor:grab;}
+  canvas:active{cursor:grabbing;}
+  .hint{color:var(--muted);font-size:11px;}
+  #status{padding:4px 14px;color:var(--muted);font-size:12px;min-height:16px;}
+  #status.err{color:var(--bad);}
+</style>
+</head>
+<body>
+<header>
+  <h1>simple-viewer</h1>
+  <p>Loads two epoc-record/epoc-reread-format CSVs entirely client-side (no server, no upload) and lets you browse, zoom, pan and shift one against the other, with a live Pearson correlation over the visible window. Parsing and rendering use typed arrays and per-pixel decimation so this scales from a 3-minute test capture up to a full lecture-length recording (~1-2h).</p>
+</header>
+
+<div class="panel">
+  <div class="row">
+    <div class="col">
+      <label class="field-label"><span class="swatch" style="background:var(--accentA)"></span>File A (e.g. original log)</label>
+      <input type="file" id="fileA" accept=".csv,text/csv,.txt,*">
+      <div class="fileinfo" id="infoA">no file loaded</div>
+    </div>
+    <div class="col">
+      <label class="field-label"><span class="swatch" style="background:var(--accentB)"></span>File B (e.g. .reread.csv)</label>
+      <input type="file" id="fileB" accept=".csv,text/csv,.txt,*">
+      <div class="fileinfo" id="infoB">no file loaded</div>
+    </div>
+    <div class="col" style="flex:1;min-width:260px;">
+      <label class="field-label">Channels</label>
+      <div id="channelChecks"><span class="hint">load a file to see channels</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="controls-row">
+    <div>
+      <label class="field-label">Zoom</label>
+      <select id="zoomSelect"></select>
+      <button id="zoomOut" title="zoom out">&minus;</button>
+      <button id="zoomIn" title="zoom in">+</button>
+    </div>
+    <div>
+      <button id="panLeft">&larr; pan</button>
+      <button id="panRight">pan &rarr;</button>
+      <button id="panHome">|&larr; start</button>
+    </div>
+    <div>
+      <label class="field-label">Shift File B later by</label>
+      <input type="number" id="shiftMs" value="0" step="1" style="width:80px;">
+      <span class="hint">ms</span>
+      <input type="range" id="shiftSlider" min="-5000" max="5000" step="1" value="0">
+      <button id="shiftReset">reset</button>
+    </div>
+  </div>
+  <div class="controls-row" style="margin-top:8px;">
+    <span class="hint">scroll position:</span>
+    <input type="range" id="scrub" min="0" max="1" step="0.0001" value="0">
+  </div>
+  <div class="hint" style="margin-top:6px;">
+    Mouse wheel over a plot zooms (centered on cursor); drag to pan, click (without dragging) to drop a cursor; correlation below each plot is recomputed live over the currently visible time window using nearest-sample matching (tolerance auto-set from File A's median sample interval).
+  </div>
+</div>
+
+<div class="panel" id="cursorPanel"><span class="hint">Click on a plot to place a cursor.</span></div>
+
+<div id="status"></div>
+<div id="channels"></div>
+
+<script>
+'use strict';
+
+/* ---------- constants ---------- */
+const COLOR_A = getComputedStyle(document.documentElement).getPropertyValue('--accentA') || '#2b6cb0';
+const COLOR_B = getComputedStyle(document.documentElement).getPropertyValue('--accentB') || '#dd6b20';
+
+const ZOOM_STEPS = [
+  {label:'Full recording', sec:null},
+  {label:'10 min', sec:600},
+  {label:'5 min', sec:300},
+  {label:'2 min', sec:120},
+  {label:'1 min', sec:60},
+  {label:'30 s', sec:30},
+  {label:'10 s', sec:10},
+  {label:'5 s', sec:5},
+  {label:'2 s', sec:2},
+  {label:'1 s', sec:1},
+  {label:'0.5 s', sec:0.5},
+];
+
+const TICK_CANDIDATES = [0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,15,30,60,120,300,600,900,1800,3600];
+
+/* ---------- utilities ---------- */
+
+function lowerBound(arr, len, target){
+  let lo = 0, hi = len;
+  while (lo < hi){
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid] < target) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+function niceTickStep(widthSec, targetTicks){
+  const raw = widthSec / targetTicks;
+  for (const c of TICK_CANDIDATES) if (c >= raw) return c;
+  return TICK_CANDIDATES[TICK_CANDIDATES.length - 1];
+}
+
+function fmtTime(sec){
+  const neg = sec < 0; sec = Math.abs(sec);
+  const h = Math.floor(sec/3600);
+  const m = Math.floor((sec%3600)/60);
+  const s = sec % 60;
+  let str;
+  if (h>0) str = h+':'+String(m).padStart(2,'0')+':'+s.toFixed(0).padStart(2,'0');
+  else if (m>0) str = m+':'+s.toFixed(s<10?2:1).padStart(4,'0');
+  else str = s.toFixed(3)+'s';
+  return (neg?'-':'')+str;
+}
+
+function fmtDuration(sec){
+  if (!isFinite(sec)) return '?';
+  const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=Math.floor(sec%60);
+  if (h>0) return `${h}h${String(m).padStart(2,'0')}m${String(s).padStart(2,'0')}s`;
+  if (m>0) return `${m}m${String(s).padStart(2,'0')}s`;
+  return `${sec.toFixed(1)}s`;
+}
+
+/* ---------- CSV parsing ----------
+   Timestamps are ~1.79e18 ns, beyond Number's exact-integer range (2^53).
+   Number() rounds each to the nearest double, absolute error ~a few hundred
+   ns -- irrelevant at the ms-scale this tool works at, since we only ever
+   difference two such values (shift math, decimation) rather than rely on
+   their exact absolute magnitude. */
+function parseCSV(text, label){
+  const lines = text.split('\n');
+  let li = 0;
+  while (li < lines.length && lines[li].trim() === '') li++;
+  if (li >= lines.length) throw new Error(label + ': empty file');
+  const header = lines[li].split(',').map(h => h.trim());
+  li++;
+  const tsIdx = header.indexOf('timestamp_ns');
+  if (tsIdx < 0) throw new Error(label + ': no timestamp_ns column found');
+  const chanCols = [];
+  header.forEach((h, idx) => {
+    if (idx === tsIdx) return;
+    if (h === 'timestamp_iso') return;
+    if (h === '' ) return;
+    if (h.endsWith('_q')) return;
+    chanCols.push({name: h, idx});
+  });
+
+  let n = 0;
+  for (let i = li; i < lines.length; i++) if (lines[i].trim() !== '') n++;
+
+  const ts = new Float64Array(n);
+  const values = {};
+  for (const c of chanCols) values[c.name] = new Float32Array(n);
+
+  let row = 0;
+  for (let i = li; i < lines.length; i++){
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    const fields = line.split(',');
+    ts[row] = Number(fields[tsIdx]);
+    for (const c of chanCols){
+      const f = fields[c.idx];
+      values[c.name][row] = (f === undefined || f === '') ? NaN : Number(f);
+    }
+    row++;
+  }
+
+  // median sample interval, from up to the first 500 diffs
+  let interval = 0.007e9; // fallback: 7ms
+  if (n > 1){
+    const sampleCount = Math.min(500, n - 1);
+    const diffs = new Float64Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) diffs[i] = ts[i+1] - ts[i];
+    diffs.sort();
+    interval = diffs[Math.floor(sampleCount/2)];
+  }
+
+  return {
+    label, n, ts, values,
+    channels: chanCols.map(c => c.name),
+    medianIntervalNs: interval,
+  };
+}
+
+/* ---------- correlation (nearest-sample matching) ---------- */
+function computeCorrelation(fileA, chA, fileB, chB, shiftNs, startAbs, endAbs, toleranceNs){
+  const tsA = fileA.ts, valA = fileA.values[chA];
+  const tsB = fileB.ts, valB = fileB.values[chB];
+  const nB = fileB.n;
+  const loA = lowerBound(tsA, fileA.n, startAbs);
+  const hiA = lowerBound(tsA, fileA.n, endAbs);
+  let sumA=0,sumB=0,sumAB=0,sumAA=0,sumBB=0,n=0;
+  for (let i = loA; i < hiA; i++){
+    const a = valA[i];
+    if (Number.isNaN(a)) continue;
+    const targetB = tsA[i] - shiftNs; // effective B time = raw + shift; want effective == tsA[i]
+    const j = lowerBound(tsB, nB, targetB);
+    let best = -1, bestDiff = Infinity;
+    if (j < nB){ const d = Math.abs(tsB[j]-targetB); if (d<bestDiff){bestDiff=d;best=j;} }
+    if (j-1 >= 0){ const d = Math.abs(tsB[j-1]-targetB); if (d<bestDiff){bestDiff=d;best=j-1;} }
+    if (best < 0 || bestDiff > toleranceNs) continue;
+    const b = valB[best];
+    if (Number.isNaN(b)) continue;
+    sumA+=a; sumB+=b; sumAB+=a*b; sumAA+=a*a; sumBB+=b*b; n++;
+  }
+  if (n < 2) return {r: NaN, n};
+  const meanA = sumA/n, meanB = sumB/n;
+  const covxy = sumAB/n - meanA*meanB;
+  const varx = sumAA/n - meanA*meanA;
+  const vary = sumBB/n - meanB*meanB;
+  const denom = Math.sqrt(varx*vary);
+  return {r: denom>0 ? covxy/denom : NaN, n};
+}
+
+/* ---------- decimation for rendering ----------
+   One pass over [rawStart,rawEnd), bucketed into pxWidth equal-time columns
+   (ts is sorted, so a single forward-moving pointer suffices). Each column
+   keeps min/max (so isolated spikes stay visible even zoomed far out over a
+   long recording) and a running mean (drawn as a connecting line so the
+   trace still reads as continuous when zoomed in close, near 1 sample/px). */
+function decimate(ts, nLen, val, rawStart, rawEnd, pxWidth){
+  const out = new Array(pxWidth).fill(null);
+  let gMin = Infinity, gMax = -Infinity;
+  if (rawEnd <= rawStart || nLen === 0) return {out, gMin, gMax};
+  const lo = lowerBound(ts, nLen, rawStart);
+  const hi = lowerBound(ts, nLen, rawEnd);
+  if (hi <= lo) return {out, gMin, gMax};
+  const span = rawEnd - rawStart;
+  let idx = lo;
+  for (let px = 0; px < pxWidth; px++){
+    const colEnd = rawStart + span * ((px+1)/pxWidth);
+    let mn=Infinity, mx=-Infinity, sum=0, cnt=0;
+    while (idx < hi && ts[idx] < colEnd){
+      const v = val[idx];
+      if (!Number.isNaN(v)){ if (v<mn) mn=v; if (v>mx) mx=v; sum+=v; cnt++; }
+      idx++;
+    }
+    if (cnt > 0){
+      out[px] = {min:mn, max:mx, mean:sum/cnt};
+      if (mn<gMin) gMin=mn;
+      if (mx>gMax) gMax=mx;
+    }
+  }
+  return {out, gMin, gMax};
+}
+
+/* ---------- state ---------- */
+const state = {
+  fileA: null, fileB: null,
+  epoch: 0,                 // ns, min of both files' first raw timestamp
+  totalDurationSec: 10,     // full-recording span
+  selectedChannels: [],
+  shiftMs: 0,
+  windowStartSec: 0,
+  windowWidthSec: 10,
+  zoomIdx: 0,
+  toleranceNs: 5e6,         // default; refined once File A loads
+  cursor: null,             // {tSec} epoch-relative, set by clicking a plot
+};
+
+/* ---------- DOM refs ---------- */
+const el = id => document.getElementById(id);
+const statusEl = el('status');
+const zoomSelect = el('zoomSelect');
+const channelChecksEl = el('channelChecks');
+const channelsEl = el('channels');
+const scrubEl = el('scrub');
+const shiftMsEl = el('shiftMs');
+const shiftSliderEl = el('shiftSlider');
+
+ZOOM_STEPS.forEach((z, i) => {
+  const opt = document.createElement('option');
+  opt.value = i; opt.textContent = z.label;
+  zoomSelect.appendChild(opt);
+});
+
+function setStatus(msg, isErr){
+  statusEl.textContent = msg || '';
+  statusEl.className = isErr ? 'err' : '';
+}
+
+/* ---------- file loading ---------- */
+function loadFile(input, which){
+  const f = input.files[0];
+  if (!f) return;
+  setStatus('Reading ' + f.name + ' ...');
+  const reader = new FileReader();
+  reader.onerror = () => setStatus('Failed to read ' + f.name, true);
+  reader.onload = () => {
+    setStatus('Parsing ' + f.name + ' ...');
+    setTimeout(() => { // let the "parsing" status paint before the sync parse blocks the UI thread
+      try {
+        const parsed = parseCSV(reader.result, f.name);
+        state[which] = parsed;
+        if (which === 'fileA') state.toleranceNs = Math.max(1e6, parsed.medianIntervalNs * 1.5);
+        recomputeEpochAndDuration();
+        rebuildChannelUI();
+        el(which === 'fileA' ? 'infoA' : 'infoB').textContent =
+          `${parsed.n.toLocaleString()} rows, ${fmtDuration((parsed.ts[parsed.n-1]-parsed.ts[0])/1e9)}\n` +
+          `channels: ${parsed.channels.join(', ')}`;
+        setStatus('Loaded ' + f.name + '.');
+        applyZoomStep(state.zoomIdx === undefined ? 0 : state.zoomIdx, 0.5);
+        scheduleRender();
+      } catch (e) {
+        setStatus('Error parsing ' + f.name + ': ' + e.message, true);
+        console.error(e);
+      }
+    }, 10);
+  };
+  reader.readAsText(f);
+}
+el('fileA').addEventListener('change', () => loadFile(el('fileA'), 'fileA'));
+el('fileB').addEventListener('change', () => loadFile(el('fileB'), 'fileB'));
+
+function recomputeEpochAndDuration(){
+  const starts = [], ends = [];
+  if (state.fileA && state.fileA.n>0){ starts.push(state.fileA.ts[0]); ends.push(state.fileA.ts[state.fileA.n-1]); }
+  if (state.fileB && state.fileB.n>0){ starts.push(state.fileB.ts[0]); ends.push(state.fileB.ts[state.fileB.n-1]); }
+  if (starts.length === 0){ state.epoch = 0; state.totalDurationSec = 10; return; }
+  state.epoch = Math.min(...starts);
+  state.totalDurationSec = Math.max(1e-3, (Math.max(...ends) - state.epoch) / 1e9);
+}
+
+/* ---------- channel selection UI ---------- */
+function rebuildChannelUI(){
+  let chans;
+  if (state.fileA && state.fileB){
+    const setB = new Set(state.fileB.channels);
+    chans = state.fileA.channels.filter(c => setB.has(c));
+  } else if (state.fileA) chans = state.fileA.channels.slice();
+  else if (state.fileB) chans = state.fileB.channels.slice();
+  else chans = [];
+
+  let selected = state.selectedChannels.filter(c => chans.includes(c));
+  if (selected.length === 0){
+    if (chans.includes('F3') && chans.includes('F8')) selected = ['F3','F8'];
+    else selected = chans.slice(0, 2);
+  }
+  state.selectedChannels = selected;
+
+  channelChecksEl.innerHTML = '';
+  if (chans.length === 0){
+    channelChecksEl.innerHTML = '<span class="hint">load a file to see channels</span>';
+  }
+  for (const c of chans){
+    const lbl = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.value = c; cb.checked = selected.includes(c);
+    cb.addEventListener('change', () => {
+      const s = new Set(state.selectedChannels);
+      if (cb.checked) s.add(c); else s.delete(c);
+      state.selectedChannels = chans.filter(ch => s.has(ch)); // keep stable order
+      rebuildChannelBlocks();
+      scheduleRender();
+    });
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(c));
+    channelChecksEl.appendChild(lbl);
+  }
+  rebuildChannelBlocks();
+}
+
+const channelCanvases = {}; // name -> {canvas, ctx, corrEl, hoverEl}
+
+function rebuildChannelBlocks(){
+  channelsEl.innerHTML = '';
+  for (const key in channelCanvases) delete channelCanvases[key];
+  for (const name of state.selectedChannels){
+    const block = document.createElement('div');
+    block.className = 'chan-block';
+    block.innerHTML = `
+      <div class="chan-head">
+        <span class="name">${name}</span>
+        <span class="corr" id="corr-${cssId(name)}">—</span>
+        <span class="hint" id="curval-${cssId(name)}"></span>
+        <span class="hint" id="hover-${cssId(name)}"></span>
+      </div>`;
+    const canvas = document.createElement('canvas');
+    block.appendChild(canvas);
+    channelsEl.appendChild(block);
+    const ctx = canvas.getContext('2d');
+    channelCanvases[name] = {canvas, ctx, corrEl: el('corr-'+cssId(name)), hoverEl: el('hover-'+cssId(name))};
+    wireCanvasInteraction(canvas, name);
+  }
+}
+function cssId(name){ return name.replace(/[^a-zA-Z0-9]/g,'_'); }
+
+/* ---------- zoom / pan / shift ---------- */
+function applyZoomStep(idx, anchorFrac){
+  idx = Math.max(0, Math.min(ZOOM_STEPS.length-1, idx));
+  const newWidth = ZOOM_STEPS[idx].sec === null ? state.totalDurationSec : ZOOM_STEPS[idx].sec;
+  const anchorTime = state.windowStartSec + anchorFrac * state.windowWidthSec;
+  state.windowStartSec = anchorTime - anchorFrac * newWidth;
+  state.windowWidthSec = newWidth;
+  state.zoomIdx = idx;
+  clampWindow();
+  zoomSelect.value = idx;
+  scheduleRender();
+}
+function clampWindow(){
+  const minStart = -state.windowWidthSec;
+  const maxStart = state.totalDurationSec;
+  if (state.windowStartSec < minStart) state.windowStartSec = minStart;
+  if (state.windowStartSec > maxStart) state.windowStartSec = maxStart;
+}
+zoomSelect.addEventListener('change', () => applyZoomStep(Number(zoomSelect.value), 0.5));
+el('zoomIn').addEventListener('click', () => applyZoomStep(state.zoomIdx+1, 0.5));
+el('zoomOut').addEventListener('click', () => applyZoomStep(state.zoomIdx-1, 0.5));
+
+function pan(fracOfWidth){
+  state.windowStartSec += fracOfWidth * state.windowWidthSec;
+  clampWindow();
+  scheduleRender();
+}
+el('panLeft').addEventListener('click', () => pan(-0.8));
+el('panRight').addEventListener('click', () => pan(0.8));
+el('panHome').addEventListener('click', () => { state.windowStartSec = 0; clampWindow(); scheduleRender(); });
+
+scrubEl.addEventListener('input', () => {
+  const frac = Number(scrubEl.value);
+  state.windowStartSec = frac * state.totalDurationSec - state.windowWidthSec/2;
+  clampWindow();
+  scheduleRender();
+});
+
+function setShift(ms){
+  ms = Math.max(-5000, Math.min(5000, ms));
+  state.shiftMs = ms;
+  shiftMsEl.value = ms;
+  shiftSliderEl.value = ms;
+  scheduleRender();
+}
+shiftMsEl.addEventListener('input', () => setShift(Number(shiftMsEl.value)||0));
+shiftSliderEl.addEventListener('input', () => setShift(Number(shiftSliderEl.value)));
+el('shiftReset').addEventListener('click', () => setShift(0));
+
+document.addEventListener('keydown', (e) => {
+  if (document.activeElement && ['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowLeft') pan(-0.2);
+  else if (e.key === 'ArrowRight') pan(0.2);
+  else if (e.key === '+' || e.key === '=') applyZoomStep(state.zoomIdx+1, 0.5);
+  else if (e.key === '-') applyZoomStep(state.zoomIdx-1, 0.5);
+});
+
+function wireCanvasInteraction(canvas, name){
+  let dragging = false, dragStartX = 0, dragStartWindowStart = 0;
+  canvas.addEventListener('mousedown', (e) => {
+    dragging = true; dragStartX = e.clientX; dragStartWindowStart = state.windowStartSec;
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const cssW = canvas.getBoundingClientRect().width;
+    const deltaPx = e.clientX - dragStartX;
+    state.windowStartSec = dragStartWindowStart - (deltaPx/cssW) * state.windowWidthSec;
+    clampWindow();
+    scheduleRender();
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (dragging && Math.abs(e.clientX - dragStartX) < 4){
+      const rect = canvas.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      setCursor(state.windowStartSec + frac * state.windowWidthSec);
+    }
+    dragging = false;
+  });
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    applyZoomStep(state.zoomIdx + (e.deltaY < 0 ? 1 : -1), frac);
+  }, {passive:false});
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const tSec = state.windowStartSec + frac * state.windowWidthSec;
+    showHover(name, tSec);
+  });
+  canvas.addEventListener('mouseleave', () => {
+    const c = channelCanvases[name];
+    if (c) c.hoverEl.textContent = '';
+  });
+}
+
+function showHover(name, tSec){
+  const c = channelCanvases[name];
+  if (!c) return;
+  const abs = tSec*1e9 + state.epoch;
+  let txt = 't=' + fmtTime(tSec);
+  if (state.fileA){
+    const i = nearestIndex(state.fileA.ts, state.fileA.n, abs);
+    if (i>=0) txt += `  A=${fmtVal(state.fileA.values[name] ? state.fileA.values[name][i] : NaN)}`;
+  }
+  if (state.fileB){
+    const targetB = abs - state.shiftMs*1e6;
+    const i = nearestIndex(state.fileB.ts, state.fileB.n, targetB);
+    if (i>=0) txt += `  B=${fmtVal(state.fileB.values[name] ? state.fileB.values[name][i] : NaN)}`;
+  }
+  c.hoverEl.textContent = txt;
+}
+function fmtVal(v){ return (v===undefined || Number.isNaN(v)) ? 'n/a' : v.toFixed(2)+'µV'; }
+function nearestIndex(ts, n, target){
+  if (n===0) return -1;
+  const j = lowerBound(ts, n, target);
+  let best=-1, bestDiff=Infinity;
+  if (j<n){ const d=Math.abs(ts[j]-target); if(d<bestDiff){bestDiff=d;best=j;} }
+  if (j-1>=0){ const d=Math.abs(ts[j-1]-target); if(d<bestDiff){bestDiff=d;best=j-1;} }
+  return best;
+}
+function fmtAbsTs(rawNs){
+  if (!isFinite(rawNs)) return 'n/a';
+  return new Date(rawNs/1e6).toISOString();
+}
+
+/* ---------- click cursor (persistent, vs. the ephemeral hover above) ---------- */
+function setCursor(tSec){
+  state.cursor = {tSec};
+  scheduleRender();
+}
+function clearCursor(){
+  state.cursor = null;
+  scheduleRender();
+}
+
+function updateCursorPanel(){
+  const panel = el('cursorPanel');
+  if (!state.cursor){
+    panel.innerHTML = '<span class="hint">Click on a plot to place a cursor.</span>';
+    for (const name of state.selectedChannels){
+      const cv = el('curval-'+cssId(name));
+      if (cv) cv.textContent = '';
+    }
+    return;
+  }
+  const abs = state.cursor.tSec*1e9 + state.epoch;
+  let idxA = -1, idxB = -1, rawA = NaN, rawB = NaN;
+  let html = '';
+  if (state.fileA && state.fileA.n>0){
+    idxA = nearestIndex(state.fileA.ts, state.fileA.n, abs);
+    if (idxA>=0){
+      rawA = state.fileA.ts[idxA];
+      html += `<div><span class="swatch" style="background:${COLOR_A}"></span><b>A</b> t=${fmtTime((rawA-state.fileA.ts[0])/1e9)} &nbsp; ts=${fmtAbsTs(rawA)}</div>`;
+    }
+  }
+  if (state.fileB && state.fileB.n>0){
+    const target = abs - state.shiftMs*1e6;
+    idxB = nearestIndex(state.fileB.ts, state.fileB.n, target);
+    if (idxB>=0){
+      rawB = state.fileB.ts[idxB];
+      html += `<div><span class="swatch" style="background:${COLOR_B}"></span><b>B</b> t=${fmtTime((rawB-state.fileB.ts[0])/1e9)} &nbsp; ts=${fmtAbsTs(rawB)}</div>`;
+    }
+  }
+  html += `<button id="clearCursorBtn" style="margin-top:4px;">clear cursor</button>`;
+  panel.innerHTML = html;
+  const btn = el('clearCursorBtn');
+  if (btn) btn.addEventListener('click', clearCursor);
+
+  for (const name of state.selectedChannels){
+    const cv = el('curval-'+cssId(name));
+    if (!cv) continue;
+    const vA = (idxA>=0 && state.fileA.values[name]) ? state.fileA.values[name][idxA] : undefined;
+    const vB = (idxB>=0 && state.fileB.values[name]) ? state.fileB.values[name][idxB] : undefined;
+    cv.innerHTML = `cursor: <span style="color:${COLOR_A}">A=${fmtVal(vA)}</span> `
+                  + `<span style="color:${COLOR_B}">B=${fmtVal(vB)}</span>`;
+  }
+}
+
+/* ---------- render ---------- */
+let renderScheduled = false;
+function scheduleRender(){
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => { renderScheduled = false; render(); });
+}
+
+function render(){
+  scrubEl.value = state.totalDurationSec>0
+    ? Math.max(0, Math.min(1, (state.windowStartSec + state.windowWidthSec/2)/state.totalDurationSec))
+    : 0;
+
+  for (const name of state.selectedChannels){
+    renderChannel(name);
+  }
+  updateCursorPanel();
+}
+
+function renderChannel(name){
+  const c = channelCanvases[name];
+  if (!c) return;
+  const {canvas, ctx} = c;
+  const rect = canvas.getBoundingClientRect();
+  const cssW = Math.max(50, Math.floor(rect.width || canvas.clientWidth || 600));
+  const cssH = 170;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(cssW*dpr) || canvas.height !== Math.round(cssH*dpr)){
+    canvas.width = Math.round(cssW*dpr);
+    canvas.height = Math.round(cssH*dpr);
+  }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,cssW,cssH);
+
+  const shiftNs = state.shiftMs * 1e6;
+  const rangeStartAbs = state.windowStartSec*1e9 + state.epoch;
+  const rangeEndAbs = (state.windowStartSec+state.windowWidthSec)*1e9 + state.epoch;
+
+  let decA = {out:[], gMin:Infinity, gMax:-Infinity};
+  let decB = {out:[], gMin:Infinity, gMax:-Infinity};
+  if (state.fileA && state.fileA.values[name]){
+    decA = decimate(state.fileA.ts, state.fileA.n, state.fileA.values[name], rangeStartAbs, rangeEndAbs, cssW);
+  }
+  if (state.fileB && state.fileB.values[name]){
+    // B's raw-time window is shifted so that after applying +shiftNs it lands in [rangeStartAbs,rangeEndAbs)
+    decB = decimate(state.fileB.ts, state.fileB.n, state.fileB.values[name], rangeStartAbs-shiftNs, rangeEndAbs-shiftNs, cssW);
+  }
+
+  let gMin = Math.min(decA.gMin, decB.gMin);
+  let gMax = Math.max(decA.gMax, decB.gMax);
+  if (!isFinite(gMin) || !isFinite(gMax)){ gMin=-100; gMax=100; }
+  if (gMin === gMax){ gMin -= 1; gMax += 1; }
+  const pad = (gMax-gMin)*0.08;
+  gMin -= pad; gMax += pad;
+
+  const plotTop = 8, plotBottom = cssH - 22, plotH = plotBottom-plotTop;
+  const valueToY = v => plotBottom - ((v-gMin)/(gMax-gMin))*plotH;
+
+  // grid + zero line
+  ctx.strokeStyle = getCss('--grid'); ctx.lineWidth = 1;
+  ctx.font = '10px sans-serif'; ctx.fillStyle = getCss('--muted');
+  const step = niceTickStep(state.windowWidthSec, 8);
+  const firstTick = Math.ceil(state.windowStartSec/step)*step;
+  for (let t = firstTick; t <= state.windowStartSec+state.windowWidthSec; t += step){
+    const x = ((t-state.windowStartSec)/state.windowWidthSec)*cssW;
+    ctx.beginPath(); ctx.moveTo(x, plotTop); ctx.lineTo(x, plotBottom); ctx.stroke();
+    ctx.fillText(fmtTime(t), Math.min(cssW-2, Math.max(2,x+2)), cssH-8);
+  }
+  if (gMin < 0 && gMax > 0){
+    ctx.strokeStyle = getCss('--muted');
+    const y0 = valueToY(0);
+    ctx.beginPath(); ctx.moveTo(0,y0); ctx.lineTo(cssW,y0); ctx.stroke();
+  }
+  // y-axis min/max labels
+  ctx.fillText(gMax.toFixed(0)+'µV', 2, plotTop+9);
+  ctx.fillText(gMin.toFixed(0)+'µV', 2, plotBottom-2);
+
+  drawSeries(ctx, decA.out, valueToY, cssW, COLOR_A);
+  drawSeries(ctx, decB.out, valueToY, cssW, COLOR_B);
+
+  // click-placed cursor
+  if (state.cursor){
+    const tSec = state.cursor.tSec;
+    if (tSec >= state.windowStartSec && tSec <= state.windowStartSec + state.windowWidthSec){
+      const x = ((tSec - state.windowStartSec) / state.windowWidthSec) * cssW;
+      ctx.save();
+      ctx.strokeStyle = getCss('--text');
+      ctx.setLineDash([4,3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x+0.5, 0); ctx.lineTo(x+0.5, cssH); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // correlation
+  if (state.fileA && state.fileB && state.fileA.values[name] && state.fileB.values[name]){
+    const {r, n} = computeCorrelation(state.fileA, name, state.fileB, name, shiftNs, rangeStartAbs, rangeEndAbs, state.toleranceNs);
+    c.corrEl.innerHTML = Number.isNaN(r)
+      ? `r=n/a (n=${n})`
+      : `r=<b>${r.toFixed(3)}</b> (n=${n}, shift=${state.shiftMs}ms)`;
+  } else {
+    c.corrEl.textContent = 'load both files to correlate';
+  }
+}
+
+function drawSeries(ctx, out, valueToY, cssW, color){
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  // min/max envelope
+  ctx.globalAlpha = 0.35;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x=0; x<out.length; x++){
+    const b = out[x];
+    if (!b) continue;
+    ctx.moveTo(x+0.5, valueToY(b.min));
+    ctx.lineTo(x+0.5, valueToY(b.max));
+  }
+  ctx.stroke();
+  // mean connecting line
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  let started = false;
+  for (let x=0; x<out.length; x++){
+    const b = out[x];
+    if (!b){ started = false; continue; }
+    const y = valueToY(b.mean);
+    if (!started){ ctx.moveTo(x+0.5, y); started = true; }
+    else ctx.lineTo(x+0.5, y);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function getCss(varName){
+  return getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || '#888';
+}
+
+window.addEventListener('resize', scheduleRender);
+
+/* ---------- expose internals for headless testing ---------- */
+window.__EV = {parseCSV, computeCorrelation, decimate, lowerBound, state, fmtAbsTs, fmtTime, nearestIndex, setCursor, updateCursorPanel};
+
+setStatus('Load File A and File B to begin.');
+</script>
+</body>
+</html>
